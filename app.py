@@ -158,14 +158,20 @@ ALL_INSTRUMENTS = sorted(set(
 def sanitize_instruments(selected):
     return [x for x in (selected or []) if x in ALL_INSTRUMENTS]
 
+# --- replace your current suggested_instruments with this ---
 def suggested_instruments(song_type: str) -> List[str]:
     if song_type in ("Bollywood Ballad", "Upbeat Bollywood", "Lo-fi Bollywood"):
-        return BOLLY_INSTRUMENTS
-    if song_type == "Devotional (Bhajan)":
-        return DEVOTIONAL_INSTRUMENTS
-    if song_type == "Sanskrit Mantra / Chant":
-        return MANTRA_INSTRUMENTS
-    return ["piano", "strings", "acoustic guitar", "bass", "pads"]
+        recs = BOLLY_INSTRUMENTS
+    elif song_type == "Devotional (Bhajan)":
+        recs = DEVOTIONAL_INSTRUMENTS
+    elif song_type == "Sanskrit Mantra / Chant":
+        recs = MANTRA_INSTRUMENTS
+    else:
+        # Fallback MUST use only items present in ALL_INSTRUMENTS
+        recs = ["piano", "strings section", "acoustic guitar", "electric bass", "pads"]
+    # ensure we never return anything outside the fixed choices
+    return [x for x in recs if x in ALL_INSTRUMENTS]
+
 
 
 def make_prompt(
@@ -313,9 +319,11 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                         label="Instruments"
                     )
 
+                    # def _update_instr(song_type_val):
+                    #     return gr.update(value=suggested_instruments(song_type_val))
+
                     def _update_instr(song_type_val):
-                        # only adjust the default selection; keep choices static
-                        return gr.update(value=suggested_instruments(song_type_val))
+                        return gr.update(value=sanitize_instruments(suggested_instruments(song_type_val)))
 
                     song_type.change(_update_instr, inputs=[song_type], outputs=instr)
 
@@ -334,20 +342,20 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                     cfg1 = gr.Slider(1.5, 4.5, value=3.0, step=0.1, label="CFG (guidance strength)")
                     seed1 = gr.Number(value=42, precision=0, label="Seed (int)")
                     model1 = gr.Dropdown(["Small (Melody)", "Medium", "Large"], value="Medium", label="Model size")
-                    prompt_out = gr.Textbox(label="Final Prompt Preview", interactive=False)
+                    prompt_out = gr.Textbox(label="Final Prompt Preview",lines=4, interactive=False)
                     gen1 = gr.Button("Generate Instrumental")
 
             audio1 = gr.Audio(label="Preview", interactive=False)
             path1 = gr.File(label="Saved WAV")
 
-            def _update_instr(song_type_val, current_sel):
-                choices = suggested_instruments(song_type_val)
-                # Keep only selections that are still valid for the new choice set
-                keep = [x for x in (current_sel or []) if x in choices]
-                return gr.update(choices=choices, value=keep)
+            # def _update_instr(song_type_val, current_sel):
+            #     choices = suggested_instruments(song_type_val)
+            #     # Keep only selections that are still valid for the new choice set
+            #     keep = [x for x in (current_sel or []) if x in choices]
+            #     return gr.update(choices=choices, value=keep)
 
             # pass BOTH the song type and the current selection into the callback
-            song_type.change(_update_instr, inputs=[song_type, instr], outputs=instr)
+            # song_type.change(_update_instr, inputs=[song_type, instr], outputs=instr)
 
 
             def _build_prompt_ui(song_type, mood, energy, extra, instruments, raga, duration):
@@ -429,8 +437,11 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                         label="Instruments (you can add/remove)"
                     )
 
+                    # def _update_instr2(song_type_val):
+                    #     return gr.update(value=suggested_instruments(song_type_val))
+
                     def _update_instr2(song_type_val):
-                        return gr.update(value=suggested_instruments(song_type_val))
+                        return gr.update(value=sanitize_instruments(suggested_instruments(song_type_val)))
 
                     song_type2.change(_update_instr2, inputs=[song_type2], outputs=instruments2)
 
@@ -443,7 +454,7 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                     seed2 = gr.Number(value=99, precision=0, label="Seed (int)")
                     model2 = gr.Dropdown(["Small (Melody)", "Medium", "Large"], value="Medium", label="Model size")
 
-            prompt2 = gr.Textbox(label="Final Prompt Preview", interactive=False)
+            prompt2 = gr.Textbox(label="Final Prompt Preview", lines=4, interactive=False)
             gen2 = gr.Button("Analyze & Generate Backing Track")
             audio2 = gr.Audio(label="Instrumental Preview", interactive=False)
             path2 = gr.File(label="Saved WAV (instrumental)")
