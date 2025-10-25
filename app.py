@@ -5,6 +5,14 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 
+# New import line for app.py
+from audio_analysis_utils import (
+    detect_key_mode, 
+    detect_vocal_range, 
+    safe_tempo_detect, 
+    safe_duration_seconds,
+)
+
 import torch
 import torchaudio
 import gradio as gr
@@ -129,6 +137,10 @@ PRO_TIPS = {
 def _clean_join(items):
     return ", ".join([s for s in items if s and s.strip()])
 
+# Function to be added to app.py or a new utility module
+
+
+
 def build_prompt_from_selections(
     song_type, instruments, extra_instr, mood, tempo_note,
     arrangement, era, key_note, scale_mode, percussion, ref_artists,
@@ -225,32 +237,32 @@ def _save_wav(wav_t: torch.Tensor, sr: int, out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(out_path), wav_t, sr)
 
-def _safe_tempo_detect(vocal_path: str) -> int:
-    if librosa is None:
-        return 100
-    try:
-        y, sr = librosa.load(vocal_path, sr=None, mono=True)
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        tempo = float(tempo[0]) if hasattr(tempo, "__len__") else float(tempo)
-        tempo = int(round(tempo)) if math.isfinite(tempo) and tempo > 0 else 100
-        return max(40, min(200, tempo))
-    except Exception:
-        return 100
+# def _safe_tempo_detect(vocal_path: str) -> int:
+#     if librosa is None:
+#         return 100
+#     try:
+#         y, sr = librosa.load(vocal_path, sr=None, mono=True)
+#         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+#         tempo = float(tempo[0]) if hasattr(tempo, "__len__") else float(tempo)
+#         tempo = int(round(tempo)) if math.isfinite(tempo) and tempo > 0 else 100
+#         return max(40, min(200, tempo))
+#     except Exception:
+#         return 100
 
-def _safe_duration_seconds(path: str, clamp_min=8, clamp_max=60) -> int:
-    try:
-        info = torchaudio.info(path)
-        secs = int(round(info.num_frames / max(1, info.sample_rate)))
-        return max(clamp_min, min(clamp_max, secs))
-    except Exception:
-        # Fallback via librosa if available
-        if librosa is not None:
-            try:
-                secs = int(round(librosa.get_duration(filename=path)))
-                return max(clamp_min, min(clamp_max, secs))
-            except Exception:
-                pass
-        return 30
+# def _safe_duration_seconds(path: str, clamp_min=8, clamp_max=60) -> int:
+#     try:
+#         info = torchaudio.info(path)
+#         secs = int(round(info.num_frames / max(1, info.sample_rate)))
+#         return max(clamp_min, min(clamp_max, secs))
+#     except Exception:
+#         # Fallback via librosa if available
+#         if librosa is not None:
+#             try:
+#                 secs = int(round(librosa.get_duration(filename=path)))
+#                 return max(clamp_min, min(clamp_max, secs))
+#             except Exception:
+#                 pass
+#         return 30
 
 # ------------ Model cache ------------
 
@@ -307,23 +319,62 @@ def gen_from_text_ui(
     progress(1.0, desc=f"Saved → {out_path.name}")
     return str(out_path), (SR, wav_t.mean(0).detach().cpu().numpy())
 
+
+# def gen_for_vocal_ui_OLD(
+#     vocal_file: str,
+#     extra_prompt: str = "",
+#     duration: int = 30,
+#     model_size: str = "medium",
+#     cfg_coef: float = 3.0,
+#     seed: Optional[int] = 42,
+#     progress=gr.Progress()
+# ) -> Tuple[str, Tuple[int, list], str]:
+#     if not vocal_file:
+#         raise gr.Error("Please upload a vocal file (WAV/MP3/FLAC).")
+
+#     progress(0, desc="Estimating tempo…")
+#     bpm = safe_tempo_detect(vocal_file)
+
+#     base_prompt = f"supportive modern pop backing, clean drums, warm bass, light pads, avoid vocals, {bpm} bpm"
+#     prompt = (base_prompt + ", " + extra_prompt.strip()) if extra_prompt.strip() else base_prompt
+
+#     progress(0.25, desc="Loading model…")
+#     model = _get_model(model_size)
+#     if seed is not None and isinstance(seed, int):
+#         torch.manual_seed(seed)
+
+#     model.set_generation_params(
+#         duration=int(duration),
+#         cfg_coef=float(cfg_coef),
+#     )
+
+#     progress(0.6, desc="Generating accompaniment…")
+#     wav = model.generate([prompt])[0]
+#     wav_t = wav if isinstance(wav, torch.Tensor) else torch.from_numpy(wav)
+#     wav_t = _ensure_stereo(wav_t)
+#     wav_t = _normalize_peak(wav_t, 0.98)
+
+#     ts = int(time.time())
+#     out_path = OUT_DIR / f"instrumental_for_vocal_{ts}.wav"
+#     _save_wav(wav_t, SR, out_path)
+
+#     progress(1.0, desc=f"Saved → {out_path.name}")
+#     return str(out_path), (SR, wav_t.mean(0).detach().cpu().numpy()), f"Detected BPM ≈ {bpm}"
+
+# Simplified gen_for_vocal_ui in app.py
 def gen_for_vocal_ui(
     vocal_file: str,
-    extra_prompt: str = "",
+    prompt: str = "", # Now accepts the full, smart prompt
     duration: int = 30,
     model_size: str = "medium",
     cfg_coef: float = 3.0,
     seed: Optional[int] = 42,
     progress=gr.Progress()
-) -> Tuple[str, Tuple[int, list], str]:
+) -> Tuple[str, Tuple[int, list]]: # Removed the bpm_label return
     if not vocal_file:
         raise gr.Error("Please upload a vocal file (WAV/MP3/FLAC).")
 
-    progress(0, desc="Estimating tempo…")
-    bpm = _safe_tempo_detect(vocal_file)
-
-    base_prompt = f"supportive modern pop backing, clean drums, warm bass, light pads, avoid vocals, {bpm} bpm"
-    prompt = (base_prompt + ", " + extra_prompt.strip()) if extra_prompt.strip() else base_prompt
+    # Removed the redundant BPM calculation and base_prompt creation
 
     progress(0.25, desc="Loading model…")
     model = _get_model(model_size)
@@ -336,7 +387,8 @@ def gen_for_vocal_ui(
     )
 
     progress(0.6, desc="Generating accompaniment…")
-    wav = model.generate([prompt])[0]
+    # Use the full, smart prompt passed directly
+    wav = model.generate([prompt])[0] 
     wav_t = wav if isinstance(wav, torch.Tensor) else torch.from_numpy(wav)
     wav_t = _ensure_stereo(wav_t)
     wav_t = _normalize_peak(wav_t, 0.98)
@@ -346,7 +398,8 @@ def gen_for_vocal_ui(
     _save_wav(wav_t, SR, out_path)
 
     progress(1.0, desc=f"Saved → {out_path.name}")
-    return str(out_path), (SR, wav_t.mean(0).detach().cpu().numpy()), f"Detected BPM ≈ {bpm}"
+    # Return only the path and audio data
+    return str(out_path), (SR, wav_t.mean(0).detach().cpu().numpy())
 
 def mix_ui(
     vocal_file: str,
@@ -365,15 +418,30 @@ def mix_ui(
     v_wav = _ensure_stereo(v_wav)
     m_wav = _ensure_stereo(m_wav)
 
-    T = max(v_wav.shape[-1], m_wav.shape[-1])
-    if v_wav.shape[-1] < T:
-        v_wav = torch.nn.functional.pad(v_wav, (0, T - v_wav.shape[-1]))
-    if m_wav.shape[-1] < T:
-        m_wav = torch.nn.functional.pad(m_wav, (0, T - m_wav.shape[-1]))
 
+    # Previous: Pad to longest length
+    # T = max(v_wav.shape[-1], m_wav.shape[-1])
+    # if v_wav.shape[-1] < T:
+    #     v_wav = torch.nn.functional.pad(v_wav, (0, T - v_wav.shape[-1]))
+    # if m_wav.shape[-1] < T:
+    #     m_wav = torch.nn.functional.pad(m_wav, (0, T - m_wav.shape[-1]))
+
+    # NEW: Determine the shortest length (Vocal) and trim the longer one (Instrumental)
+    V_T = v_wav.shape[-1]
+    M_T = m_wav.shape[-1]
+    
+    T = min(V_T, M_T) # The final mix length will be the shortest input length
+
+    # Trim to shortest length
+    v_wav = v_wav[..., :T]
+    m_wav = m_wav[..., :T]
+
+
+    # Apply Gains
     v_wav = v_wav * _db_to_lin(vocal_gain_db)
     m_wav = m_wav * _db_to_lin(music_gain_db)
 
+    # Mix and Master (Soft Limiter)
     mix = v_wav + m_wav
     mix = _soft_limiter(mix, limiter_ceiling_db)
 
@@ -558,10 +626,18 @@ Generate instrumentals with Meta MusicGen, match an uploaded vocal, and mix.
             cfg2 = gr.Slider(0.0, 6.0, value=3.0, step=0.1, label="cfg_coef")
 
         # Auto-estimate duration from uploaded vocal and prefill the slider
+        # def _autofill_duration(vocal_file):
+        #     if not vocal_file:
+        #         return gr.update()
+        #     secs = safe_duration_seconds(vocal_file, 8, 60)
+        #     return gr.update(value=secs)
+
+        # Change the old _autofill_duration:
         def _autofill_duration(vocal_file):
             if not vocal_file:
                 return gr.update()
-            secs = _safe_duration_seconds(vocal_file, 8, 60)
+            # Now uses the imported function from our new utility file
+            secs = safe_duration_seconds(vocal_file, 8, 60)
             return gr.update(value=secs)
 
         vocal_in.change(_autofill_duration, inputs=[vocal_in], outputs=[duration2])
@@ -571,9 +647,38 @@ Generate instrumentals with Meta MusicGen, match an uploaded vocal, and mix.
         out_path2 = gr.File(label="Saved WAV")
         audio2 = gr.Audio(label="Preview", type="numpy")
 
+        # def _wrap_gen_for_vocal(vocal_file, extra_prompt, duration, model_size, seed, cfg):
+        #     path, audio, bpm_label = gen_for_vocal_ui(vocal_file, extra_prompt, duration, model_size, cfg, seed)
+        #     bpm_md = f"**{bpm_label}**"
+        #     return bpm_md, path, audio
+
         def _wrap_gen_for_vocal(vocal_file, extra_prompt, duration, model_size, seed, cfg):
-            path, audio, bpm_label = gen_for_vocal_ui(vocal_file, extra_prompt, duration, model_size, cfg, seed)
-            bpm_md = f"**{bpm_label}**"
+            if not vocal_file:
+                raise gr.Error("Please upload a vocal file (WAV/MP3/FLAC).")
+            
+            # --- 1. Load Vocal for Analysis ---
+            # Load with librosa to get numpy array for analysis functions
+            y, sr = librosa.load(vocal_file, sr=None, mono=True)
+
+            # --- 2. Perform Professional Analysis using Utils ---
+            bpm = safe_tempo_detect(vocal_file) # Replaces old simple BPM detection
+            key, mode = detect_key_mode(y, sr)
+            vrange = detect_vocal_range(y, sr)
+
+            # --- 3. Construct Advanced Prompt ---
+            key_prompt = f"in the key of {key} {mode}" if key and mode else "musically complementary"
+            
+            base_prompt = (
+                f"supportive modern pop backing {key_prompt}, clean drums, warm bass, light pads, "
+                f"support a singer with range {vrange}, {bpm} bpm, avoid vocals"
+            )
+            final_prompt = (base_prompt + ", " + extra_prompt.strip()) if extra_prompt.strip() else base_prompt
+            
+            # --- 4. Call the core generation function ---
+            path, audio, _ = gen_for_vocal_ui(vocal_file, final_prompt, duration, model_size, cfg, seed)
+            
+            # --- 5. Return Results to UI ---
+            bpm_md = f"**Detected BPM ≈ {bpm}, Key/Mode: {key} {mode}**"
             return bpm_md, path, audio
 
         gen2_btn.click(
@@ -601,4 +706,4 @@ Generate instrumentals with Meta MusicGen, match an uploaded vocal, and mix.
         )
 
 if __name__ == "__main__":
-    demo.launch(share=False)
+    demo.launch(share=True)

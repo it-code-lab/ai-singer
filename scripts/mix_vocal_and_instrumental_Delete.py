@@ -1,4 +1,5 @@
 import numpy as np, librosa, soundfile as sf
+from audio_analysis_utils import _detect_key_mode
 
 VOCAL = "vocal.wav"                      # your acapella (mono)
 INSTR = "instrumental_for_vocal_32k.wav" # or instrumental_32k.wav

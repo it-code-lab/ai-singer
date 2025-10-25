@@ -1,5 +1,6 @@
 import numpy as np, torch, torchaudio, librosa
 from audiocraft.models import MusicGen
+from audio_analysis_utils import detect_key_mode, detect_vocal_range, safe_tempo_detect
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SR_VOC = 32000
@@ -7,28 +8,42 @@ SR_VOC = 32000
 VOCAL_PATH = "vocal.wav"  # your dry vocal (mono is best)
 
 y, sr = librosa.load(VOCAL_PATH, sr=None, mono=True)
+
+
 # rough tempo estimate
-tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-# tempo can be a numpy array (e.g., [120.0]), so extract scalar
-tempo = float(tempo[0]) if isinstance(tempo, (np.ndarray, list)) else float(tempo)
-tempo = int(round(tempo)) if np.isfinite(tempo) and tempo > 0 else 100
+# tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+# tempo = float(tempo[0]) if isinstance(tempo, (np.ndarray, list)) else float(tempo)
+# tempo = int(round(tempo)) if np.isfinite(tempo) and tempo > 0 else 100
 
 
 # rough vocal range estimate
-f0 = librosa.yin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C6'), sr=sr)
-f0 = f0[np.isfinite(f0)]
-if len(f0):
-    lo = librosa.hz_to_note(np.percentile(f0, 10))
-    hi = librosa.hz_to_note(np.percentile(f0, 90))
-    vrange = f"{lo}-{hi}"
-else:
-    vrange = "C3-C5"
+# f0 = librosa.yin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C6'), sr=sr)
+# f0 = f0[np.isfinite(f0)]
+# if len(f0):
+#     lo = librosa.hz_to_note(np.percentile(f0, 10))
+#     hi = librosa.hz_to_note(np.percentile(f0, 90))
+#     vrange = f"{lo}-{hi}"
+# else:
+#     vrange = "C3-C5"
+
+
+# # 3. Auto-Detect Key and Mode (NEW PROFESSIONAL IMPROVEMENT)
+# key, mode = detect_key_mode(y, sr)
+
+tempo = safe_tempo_detect(VOCAL_PATH)
+key, mode = detect_key_mode(y, sr)
+vrange = detect_vocal_range(y, sr)
+
+
+key_prompt = f"in the key of {key} {mode}" if key and mode else "musically complementary"
+
 
 duration = max(10, int(np.ceil(len(y)/sr)))  # seconds
 
+
 prompt = (
-    f"modern pop backing track around {tempo} bpm, support a singer with range {vrange}, "
-    "steady drums, electric bass, warm keys, no vocals"
+    f"modern pop backing track {key_prompt}, around {tempo} bpm, support a singer with range {vrange}, "
+    "steady drums, electric bass, warm keys, clean mix, no vocals"
 )
 
 print(f"Prompt: {prompt} (duration ~{duration}s)")

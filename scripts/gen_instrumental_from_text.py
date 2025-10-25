@@ -1,6 +1,8 @@
 import torch, torchaudio, numpy as np
 from audiocraft.models import MusicGen
 
+
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SR = 32000  # MusicGen uses 32 kHz
 DURATION = 20  # seconds
