@@ -20,7 +20,7 @@ from audio_analysis_utils import (
     detect_vocal_range,
     safe_duration_seconds,
 )
-
+from threading import Timer
 # -----------------------------------------------------------------------------
 # Global config
 # -----------------------------------------------------------------------------
@@ -30,6 +30,18 @@ DEFAULT_MODEL = "facebook/musicgen-medium"
 
 # Cache models by size so switching is instant
 _MODEL_CACHE = {}
+
+
+
+
+_mix_timer = None
+def debounce_mix(vocal_file, instr_file, vg, ig, og):
+    global _mix_timer
+    if _mix_timer:
+        _mix_timer.cancel()
+    _mix_timer = Timer(0.8, lambda: mix_tracks(vocal_file, instr_file, vg, ig, og))
+    _mix_timer.start()
+    return None, None  # temporarily return empty preview until executed
 
 def get_model(model_size: str) -> MusicGen:
     """Return a MusicGen model on correct device with sane defaults."""
@@ -533,6 +545,12 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
 
 
             mix_btn.click(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+
+            # Real-time preview when sliders move
+            vocal_gain.change(debounce_mix, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+            instr_gain.change(debounce_mix, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+            out_gain.change(debounce_mix, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+
 
     gr.Markdown("""
     ---
