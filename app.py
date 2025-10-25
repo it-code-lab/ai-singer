@@ -2,7 +2,6 @@
 import os
 import math
 import time
-import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -17,7 +16,7 @@ except Exception:
     librosa = None
 
 try:
-    import soundfile as sf
+    import soundfile as sf  # noqa: F401  (used indirectly by torchaudio backend)
 except Exception:
     sf = None
 
@@ -96,6 +95,18 @@ PROMPT_PRESETS = {
     },
 }
 
+# Raag / Thaat → prompt phrase
+RAGA_HINTS = {
+    "": "",
+    "Raag Yaman (Kalyan thaat)": "hints of Raag Yaman (Lydian feel)",
+    "Raag Bhairav": "touches of Raag Bhairav (Phrygian ♮3 mood)",
+    "Raag Bhupali (Bilawal/Kalyan mix)": "phrases inspired by Raag Bhupali (pentatonic major vibe)",
+    "Raag Kafi": "Kafi colour (Dorian/folksy sweetness)",
+    "Raag Khamaj": "Khamaj flavour (Mixolydian warmth)",
+    "Raag Todi": "Todi shades (complex, yearning microtonal feel)",
+    "Raag Darbari": "Darbari gravitas (deep, regal ambience)",
+}
+
 ARRANGEMENT_CHOICES = [
     "steady all through",
     "intro calm → verse moderate → chorus full",
@@ -103,12 +114,26 @@ ARRANGEMENT_CHOICES = [
     "soft intro → build through verse → big chorus → breakdown → final chorus",
 ]
 
+PRO_TIPS = {
+    "Bollywood Romantic Ballad": "CFG ~2.0–3.5 • Keep seed fixed for consistency (e.g., 42). Change seed for alternate takes.",
+    "Bollywood Upbeat / Dance": "CFG ~2.5–4.0 • If drums feel weak, bump CFG slightly and try 2–3 different seeds.",
+    "Devotional (Bhajan)": "CFG ~2.5–4.0 • Lower temperature helps steadiness. Keep seed fixed across verses.",
+    "Sufi / Qawwali": "CFG ~2.5–4.0 • Try a few seeds to find energetic builds that complement claps/tabla.",
+    "Ghazal": "CFG ~2.0–3.0 • Fixed seed gives intimate continuity. Try 2–3 seeds for subtle texture changes.",
+    "Sanskrit Mantra / Chant": "CFG ~2.0–3.0 • Low temperature & fixed seed reinforce the meditative drone/pattern.",
+    "Kirtan / Call-and-Response": "CFG ~2.5–4.0 • Fixed seed for main take; try 1–2 higher seeds for livelier chorus.",
+    "Filmi Orchestral / Cinematic": "CFG ~3.0–4.5 • Try multiple seeds—arrangement variety helps cinematic arcs.",
+    "Lo-fi Bollywood": "CFG ~2.0–3.0 • Keep seed fixed; small CFG changes affect drums/bass tightness.",
+}
+
 def _clean_join(items):
     return ", ".join([s for s in items if s and s.strip()])
 
-def build_prompt_from_selections(song_type, instruments, extra_instr, mood, tempo_note,
-                                 arrangement, era, key_note, scale_mode, percussion, ref_artists,
-                                 fx, mix_notes, language_hint, lyric_theme):
+def build_prompt_from_selections(
+    song_type, instruments, extra_instr, mood, tempo_note,
+    arrangement, era, key_note, scale_mode, percussion, ref_artists,
+    fx, mix_notes, language_hint, lyric_theme, raag_phrase: str = ""
+):
     line1 = [song_type]
     if language_hint:
         line1.append(f"({language_hint})")
@@ -116,7 +141,6 @@ def build_prompt_from_selections(song_type, instruments, extra_instr, mood, temp
         line1.append(f"— theme: {lyric_theme}")
     header = " ".join([s for s in line1 if s])
 
-    # Instruments
     inst_parts = []
     if instruments:
         inst_parts.append(_clean_join(instruments))
@@ -124,10 +148,8 @@ def build_prompt_from_selections(song_type, instruments, extra_instr, mood, temp
         inst_parts.append(extra_instr)
     inst_block = _clean_join(inst_parts)
 
-    # Percussion
     perc_block = _clean_join(percussion)
 
-    # Mood / Tempo / Key
     props = []
     if mood:
         props.append(mood)
@@ -142,16 +164,14 @@ def build_prompt_from_selections(song_type, instruments, extra_instr, mood, temp
         props.append(f"mode {scale_mode}")
     if era:
         props.append(f"{era} aesthetics")
+    if raag_phrase:
+        props.append(raag_phrase)
 
-    # Arrangement & mix
     arrange = f"Arrangement: {arrangement}." if arrangement else ""
     fx_block = f"FX: {fx}." if fx else ""
     mix = f"Mix/Production: {mix_notes}." if mix_notes else ""
-
-    # References
     ref = f"Reference vibe: {_clean_join(ref_artists)}." if ref_artists else ""
 
-    # Final prompt
     prompt_lines = [
         header.strip(),
         f"Instruments: {inst_block}." if inst_block else "",
@@ -168,23 +188,15 @@ def build_prompt_from_selections(song_type, instruments, extra_instr, mood, temp
 # ------------ Utilities ------------
 
 def _ensure_stereo(y: torch.Tensor) -> torch.Tensor:
-    """Make [channels, time] with 2 channels."""
     if y.dim() == 1:
-        y = y.unsqueeze(0)  # [1, T]
+        y = y.unsqueeze(0)
     if y.shape[0] == 1:
-        y = y.repeat(2, 1)  # stereo
-    return y
-
-def _ensure_2d_for_save(y: torch.Tensor) -> torch.Tensor:
-    """torchaudio.save expects 2D [channels, time]."""
-    if y.dim() == 3 and y.shape[0] == 1:
-        y = y.squeeze(0)
+        y = y.repeat(2, 1)
     return y
 
 def _resample_if_needed(wav: torch.Tensor, sr: int, target_sr: int = SR) -> torch.Tensor:
     if sr == target_sr:
         return wav
-    # wav: [channels, time]
     return torchaudio.functional.resample(wav, sr, target_sr)
 
 def _normalize_peak(wav: torch.Tensor, target_peak: float = 0.98) -> torch.Tensor:
@@ -197,28 +209,23 @@ def _db_to_lin(db):
     return 10.0 ** (db / 20.0)
 
 def _soft_limiter(wav: torch.Tensor, ceiling_db: float = -1.0) -> torch.Tensor:
-    # Gentle arctan/tanh-style soft clip then scale to ceiling
     ceiling = _db_to_lin(ceiling_db)
     wav = torch.tanh(2.5 * wav)
-    return _normalize_peak(wav, ceiling)
+    peak = wav.abs().max().item()
+    if peak > 0:
+        wav = wav * min(1.0, ceiling / peak)
+    return wav
 
 def _save_wav(wav_t: torch.Tensor, sr: int, out_path: Path):
-    # shape to [channels, samples]
     if wav_t.ndim == 1:
-        wav_t = wav_t.unsqueeze(0)  # [1, T]
+        wav_t = wav_t.unsqueeze(0)
     elif wav_t.ndim == 3:
-        # collapse batch if present: [B, C, T] -> [C, T]
         wav_t = wav_t[0]
-
-    # ensure float32 on CPU and sane range
     wav_t = wav_t.detach().to(torch.float32).clamp_(-1.0, 1.0).cpu()
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    torchaudio.save(str(out_path), wav_t, sr)  # channels_first=True by default
-
+    torchaudio.save(str(out_path), wav_t, sr)
 
 def _safe_tempo_detect(vocal_path: str) -> int:
-    """Best-effort tempo detection; returns fallback 100 if librosa unavailable."""
     if librosa is None:
         return 100
     try:
@@ -230,28 +237,35 @@ def _safe_tempo_detect(vocal_path: str) -> int:
     except Exception:
         return 100
 
+def _safe_duration_seconds(path: str, clamp_min=8, clamp_max=60) -> int:
+    try:
+        info = torchaudio.info(path)
+        secs = int(round(info.num_frames / max(1, info.sample_rate)))
+        return max(clamp_min, min(clamp_max, secs))
+    except Exception:
+        # Fallback via librosa if available
+        if librosa is not None:
+            try:
+                secs = int(round(librosa.get_duration(filename=path)))
+                return max(clamp_min, min(clamp_max, secs))
+            except Exception:
+                pass
+        return 30
+
 # ------------ Model cache ------------
 
 _MODEL_CACHE = {}
 
 def _get_model(model_size: str = "medium") -> MusicGen:
-    """
-    Loads and caches a MusicGen model on DEVICE.
-    model_size in {"small", "medium", "large"}; 'medium' is a good balance.
-    """
     key = (model_size, DEVICE)
     if key in _MODEL_CACHE:
         return _MODEL_CACHE[key]
-
     repo = {
         "small": "facebook/musicgen-small",
         "medium": "facebook/musicgen-medium",
         "large": "facebook/musicgen-large",
     }.get(model_size, "facebook/musicgen-medium")
-
     model = MusicGen.get_pretrained(repo)
-    # new API: set device on subsequent tensor ops
-    # Generate returns torch tensor on CPU by default; we can keep it that way.
     _MODEL_CACHE[key] = model
     return model
 
@@ -268,17 +282,11 @@ def gen_from_text_ui(
     seed: Optional[int] = 42,
     progress=gr.Progress()
 ) -> Tuple[str, Tuple[int, list]]:
-    """
-    Returns: (file_path, (sr, [float_samples])) for Gradio Audio
-    """
     progress(0, desc="Loading model…")
     model = _get_model(model_size)
-
-    # Parameters
     if seed is not None and isinstance(seed, int):
         torch.manual_seed(seed)
 
-    # Set params
     model.set_generation_params(
         duration=int(duration),
         top_k=int(top_k),
@@ -288,23 +296,15 @@ def gen_from_text_ui(
     )
 
     progress(0.3, desc="Generating audio…")
-    wav = model.generate([prompt])[0]  # [time] (numpy) or torch? audiocraft returns torch on CPU
-    if isinstance(wav, torch.Tensor):
-        wav_t = wav
-    else:
-        wav_t = torch.from_numpy(wav)
-
-    # Format: [channels, time] at SR
+    wav = model.generate([prompt])[0]
+    wav_t = wav if isinstance(wav, torch.Tensor) else torch.from_numpy(wav)
     wav_t = _ensure_stereo(wav_t)
     wav_t = _normalize_peak(wav_t, 0.98)
 
     ts = int(time.time())
     out_path = OUT_DIR / f"instrumental_from_text_{ts}.wav"
     _save_wav(wav_t, SR, out_path)
-
     progress(1.0, desc=f"Saved → {out_path.name}")
-    # Return a playable tuple for the Audio component (sr, samples)
-    # return str(out_path), (SR, wav_t.mean(0).detach().cpu().numpy().tolist())
     return str(out_path), (SR, wav_t.mean(0).detach().cpu().numpy())
 
 def gen_for_vocal_ui(
@@ -316,9 +316,6 @@ def gen_for_vocal_ui(
     seed: Optional[int] = 42,
     progress=gr.Progress()
 ) -> Tuple[str, Tuple[int, list], str]:
-    """
-    Returns: (instrumental_path, (sr, samples), detected_bpm_text)
-    """
     if not vocal_file:
         raise gr.Error("Please upload a vocal file (WAV/MP3/FLAC).")
 
@@ -326,10 +323,7 @@ def gen_for_vocal_ui(
     bpm = _safe_tempo_detect(vocal_file)
 
     base_prompt = f"supportive modern pop backing, clean drums, warm bass, light pads, avoid vocals, {bpm} bpm"
-    if extra_prompt and extra_prompt.strip():
-        prompt = base_prompt + ", " + extra_prompt.strip()
-    else:
-        prompt = base_prompt
+    prompt = (base_prompt + ", " + extra_prompt.strip()) if extra_prompt.strip() else base_prompt
 
     progress(0.25, desc="Loading model…")
     model = _get_model(model_size)
@@ -352,7 +346,6 @@ def gen_for_vocal_ui(
     _save_wav(wav_t, SR, out_path)
 
     progress(1.0, desc=f"Saved → {out_path.name}")
-    # return str(out_path), (SR, wav_t.mean(0).detach().cpu().numpy().tolist()), f"Detected BPM ≈ {bpm}"
     return str(out_path), (SR, wav_t.mean(0).detach().cpu().numpy()), f"Detected BPM ≈ {bpm}"
 
 def mix_ui(
@@ -364,42 +357,34 @@ def mix_ui(
 ) -> Tuple[str, Tuple[int, list]]:
     if not vocal_file or not instrumental_file:
         raise gr.Error("Please provide both vocal and instrumental files.")
-
-    # Load with torchaudio to avoid unnecessary deps
-    v_wav, v_sr = torchaudio.load(vocal_file)   # [channels, time]
+    v_wav, v_sr = torchaudio.load(vocal_file)
     m_wav, m_sr = torchaudio.load(instrumental_file)
 
     v_wav = _resample_if_needed(v_wav, v_sr, SR)
     m_wav = _resample_if_needed(m_wav, m_sr, SR)
-
     v_wav = _ensure_stereo(v_wav)
     m_wav = _ensure_stereo(m_wav)
 
-    # Align lengths
     T = max(v_wav.shape[-1], m_wav.shape[-1])
     if v_wav.shape[-1] < T:
-        pad = T - v_wav.shape[-1]
-        v_wav = torch.nn.functional.pad(v_wav, (0, pad))
+        v_wav = torch.nn.functional.pad(v_wav, (0, T - v_wav.shape[-1]))
     if m_wav.shape[-1] < T:
-        pad = T - m_wav.shape[-1]
-        m_wav = torch.nn.functional.pad(m_wav, (0, pad))
+        m_wav = torch.nn.functional.pad(m_wav, (0, T - m_wav.shape[-1]))
 
-    # Apply gain
     v_wav = v_wav * _db_to_lin(vocal_gain_db)
     m_wav = m_wav * _db_to_lin(music_gain_db)
 
-    # Simple blend + limiter
     mix = v_wav + m_wav
     mix = _soft_limiter(mix, limiter_ceiling_db)
 
     ts = int(time.time())
     out_path = OUT_DIR / f"song_mix_{ts}.wav"
     _save_wav(mix, SR, out_path)
-    return str(out_path), (SR, mix.mean(0).detach().cpu().numpy().tolist())
+    return str(out_path), (SR, mix.mean(0).detach().cpu().numpy())
 
 # ------------ UI ------------
 
-def render_prompt_builder(target_extra_prompt_box: gr.Textbox):
+def render_prompt_builder(target_extra_prompt_box: gr.Textbox, pro_tips_md: gr.Markdown):
     with gr.Accordion("🎼 Prompt Builder (Indian Styles)", open=False):
         with gr.Row():
             song_type = gr.Dropdown(
@@ -437,6 +422,11 @@ def render_prompt_builder(target_extra_prompt_box: gr.Textbox):
             )
 
         with gr.Row():
+            raag = gr.Dropdown(
+                label="Raag / Thaat (inject flavour)",
+                choices=list(RAGA_HINTS.keys()),
+                value=""
+            )
             arrangement = gr.Dropdown(
                 label="Arrangement / Energy Curve",
                 choices=ARRANGEMENT_CHOICES,
@@ -472,25 +462,27 @@ def render_prompt_builder(target_extra_prompt_box: gr.Textbox):
 
         def _sync_presets(st):
             preset = PROMPT_PRESETS.get(st, PROMPT_PRESETS["Bollywood Romantic Ballad"])
+            # Update Pro Tips too
+            tips = PRO_TIPS.get(st, "CFG ~2.0–4.0 • Keep seed fixed for consistency; change for variants.")
             return (
                 gr.update(value=preset["moods"][0] if preset["moods"] else None),
                 gr.update(value=preset["tempos"][0] if preset["tempos"] else None),
                 gr.update(value=preset["default_instruments"]),
                 gr.update(value=preset.get("percussion", [])),
-                gr.update(value=[]),  # clear refs by default
+                gr.update(value=[], interactive=True),
+                gr.update(value=f"### Pro tips\n{tips}\n\n- **Seed:** keep fixed to lock arrangement; change to explore variations.\n- **CFG:** higher = closer to prompt, lower = looser/airier."),
             )
 
         song_type.change(
             _sync_presets,
             inputs=[song_type],
-            outputs=[mood, tempo, base_instruments, percussion, ref_artists]
+            outputs=[mood, tempo, base_instruments, percussion, ref_artists, pro_tips_md]
         )
 
         make_prompt_btn = gr.Button("✨ Generate Prompt")
         out_prompt = gr.Textbox(label="Generated Prompt", lines=4)
 
-        def _make_prompt(st, bi, ei, m, t, arr, e, keyn, mode, perc, refs, fxv, mixv, lang, theme):
-            # extract BPM number range for readability ("86–100" → keep as is)
+        def _make_prompt(st, bi, ei, m, t, arr, e, keyn, mode, perc, refs, fxv, mixv, lang, theme, raag_sel):
             tempo_note = t
             prompt = build_prompt_from_selections(
                 song_type=st,
@@ -508,13 +500,14 @@ def render_prompt_builder(target_extra_prompt_box: gr.Textbox):
                 mix_notes=mixv,
                 language_hint=lang,
                 lyric_theme=theme,
+                raag_phrase=RAGA_HINTS.get(raag_sel, ""),
             )
             return prompt, gr.update(value=prompt)
 
         make_prompt_btn.click(
             _make_prompt,
             inputs=[song_type, base_instruments, extra_instruments, mood, tempo, arrangement, era,
-                    key_note, scale_mode, percussion, ref_artists, fx, mix_notes, language, lyric_theme],
+                    key_note, scale_mode, percussion, ref_artists, fx, mix_notes, language, lyric_theme, raag],
             outputs=[out_prompt, target_extra_prompt_box]
         )
 
@@ -528,6 +521,7 @@ Generate instrumentals with Meta MusicGen, match an uploaded vocal, and mix.
 """
     )
 
+    # -------- Tab 1 --------
     with gr.Tab("1) Instrumental from Text"):
         with gr.Row():
             prompt = gr.Textbox(label="Text prompt", placeholder="e.g., modern pop instrumental, bright synths, punchy drums, 120 bpm, no vocals", lines=3)
@@ -551,15 +545,27 @@ Generate instrumentals with Meta MusicGen, match an uploaded vocal, and mix.
             outputs=[out_path1, audio1],
         )
 
+    # -------- Tab 2 --------
     with gr.Tab("2) Instrumental for Vocal"):
         vocal_in = gr.Audio(label="Upload Vocal (WAV/MP3/FLAC)", type="filepath")
         extra_prompt = gr.Textbox(label="Extra prompt (optional)", placeholder="e.g., airy pads, subtle guitar")
-        _ = render_prompt_builder(target_extra_prompt_box=extra_prompt)
+        pro_tips_md = gr.Markdown("### Pro tips\nSelect a song type below to get CFG/seed suggestions.")
+        _ = render_prompt_builder(target_extra_prompt_box=extra_prompt, pro_tips_md=pro_tips_md)
         with gr.Row():
             duration2 = gr.Slider(8, 60, value=30, step=1, label="Duration (seconds)")
             model_size2 = gr.Dropdown(["small", "medium", "large"], value="medium", label="Model size")
             seed2 = gr.Number(value=42, label="Seed (int or blank for random)")
             cfg2 = gr.Slider(0.0, 6.0, value=3.0, step=0.1, label="cfg_coef")
+
+        # Auto-estimate duration from uploaded vocal and prefill the slider
+        def _autofill_duration(vocal_file):
+            if not vocal_file:
+                return gr.update()
+            secs = _safe_duration_seconds(vocal_file, 8, 60)
+            return gr.update(value=secs)
+
+        vocal_in.change(_autofill_duration, inputs=[vocal_in], outputs=[duration2])
+
         gen2_btn = gr.Button("Generate Matching Instrumental")
         bpm_text = gr.Markdown()
         out_path2 = gr.File(label="Saved WAV")
@@ -567,8 +573,8 @@ Generate instrumentals with Meta MusicGen, match an uploaded vocal, and mix.
 
         def _wrap_gen_for_vocal(vocal_file, extra_prompt, duration, model_size, seed, cfg):
             path, audio, bpm_label = gen_for_vocal_ui(vocal_file, extra_prompt, duration, model_size, cfg, seed)
-            bpm_text = f"**{bpm_label}**"
-            return bpm_text, path, audio
+            bpm_md = f"**{bpm_label}**"
+            return bpm_md, path, audio
 
         gen2_btn.click(
             _wrap_gen_for_vocal,
@@ -576,6 +582,7 @@ Generate instrumentals with Meta MusicGen, match an uploaded vocal, and mix.
             outputs=[bpm_text, out_path2, audio2]
         )
 
+    # -------- Tab 3 --------
     with gr.Tab("3) Mix Vocal + Instrumental"):
         v_in = gr.Audio(label="Vocal file", type="filepath")
         m_in = gr.Audio(label="Instrumental file", type="filepath")
@@ -594,5 +601,4 @@ Generate instrumentals with Meta MusicGen, match an uploaded vocal, and mix.
         )
 
 if __name__ == "__main__":
-    # share=False keeps it local; set to True if you want a public link
     demo.launch(share=False)
