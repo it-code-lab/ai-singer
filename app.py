@@ -41,7 +41,8 @@ def debounce_mix(vocal_file, instr_file, vg, ig, og):
         _mix_timer.cancel()
     _mix_timer = Timer(0.8, lambda: mix_tracks(vocal_file, instr_file, vg, ig, og))
     _mix_timer.start()
-    return None, None  # temporarily return empty preview until executed
+    return None, None  # no updates until the Timer runs
+
 
 def get_model(model_size: str) -> MusicGen:
     """Return a MusicGen model on correct device with sane defaults."""
@@ -149,6 +150,13 @@ STRUCTURE_PRESETS = [
     "short intro-verse-chorus",
 ]
 
+
+ALL_INSTRUMENTS = sorted(set(
+    BOLLY_INSTRUMENTS + DEVOTIONAL_INSTRUMENTS + MANTRA_INSTRUMENTS
+))
+
+def sanitize_instruments(selected):
+    return [x for x in (selected or []) if x in ALL_INSTRUMENTS]
 
 def suggested_instruments(song_type: str) -> List[str]:
     if song_type in ("Bollywood Ballad", "Upbeat Bollywood", "Lo-fi Bollywood"):
@@ -297,7 +305,20 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                     energy = gr.Textbox(label="Energy (e.g., mellow, driving)")
                     raga = gr.Dropdown(list(RAGA_HINTS.keys()), label="Raag/Thaat (optional)", value="None")
                     structure = gr.Dropdown(STRUCTURE_PRESETS, label="Structure", value=STRUCTURE_PRESETS[0])
-                    instr = gr.CheckboxGroup(choices=suggested_instruments("Bollywood Ballad"), label="Suggested Instruments")
+                    # instr = gr.CheckboxGroup(choices=suggested_instruments("Bollywood Ballad"), label="Suggested Instruments")
+
+                    instr = gr.CheckboxGroup(
+                        choices=ALL_INSTRUMENTS,
+                        value=suggested_instruments("Bollywood Ballad"),
+                        label="Instruments"
+                    )
+
+                    def _update_instr(song_type_val):
+                        # only adjust the default selection; keep choices static
+                        return gr.update(value=suggested_instruments(song_type_val))
+
+                    song_type.change(_update_instr, inputs=[song_type], outputs=instr)
+
                     extra = gr.Textbox(label="Extra prompt (optional)")
 
                     with gr.Accordion("Pro Tips", open=False):
@@ -319,11 +340,15 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
             audio1 = gr.Audio(label="Preview", interactive=False)
             path1 = gr.File(label="Saved WAV")
 
-            def _update_instr(song_type_val):
-                #return gr.CheckboxGroup.update(choices=suggested_instruments(song_type_val))
-                return gr.update(choices=suggested_instruments(song_type_val))
+            def _update_instr(song_type_val, current_sel):
+                choices = suggested_instruments(song_type_val)
+                # Keep only selections that are still valid for the new choice set
+                keep = [x for x in (current_sel or []) if x in choices]
+                return gr.update(choices=choices, value=keep)
 
-            song_type.change(_update_instr, inputs=song_type, outputs=instr)
+            # pass BOTH the song type and the current selection into the callback
+            song_type.change(_update_instr, inputs=[song_type, instr], outputs=instr)
+
 
             def _build_prompt_ui(song_type, mood, energy, extra, instruments, raga, duration):
                 # No key/tempo/vocal range on text tab
@@ -341,7 +366,14 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
             auto_btn.click(_pro_tips, [], [cfg1, seed1])
 
             def run_text(song_type, mood, energy, extra, instruments, raga, duration, model, cfg, seed):
-                prompt = make_prompt(song_type, mood, energy, extra, instruments or [], raga, None, None, None, structure=None)
+                # prompt = make_prompt(song_type, mood, energy, extra, instruments or [], raga, None, None, None, structure=None)
+
+                prompt = make_prompt(
+                    song_type, mood, energy, extra,
+                    sanitize_instruments(instruments),
+                    raga, None, None, None, structure=None
+                )
+
                 out_path, wav = generate_music(prompt, duration, model, cfg, int(seed))
                 # Return audio numpy for immediate preview
                 wav_np = _ensure_2d_cpu_f32(wav).numpy().T  # (T, C)
@@ -365,9 +397,48 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
 
                 with gr.Column(scale=1):
                     song_type2 = gr.Dropdown(SONG_TYPES, label="Song Type", value="Devotional (Bhajan)")
+
+
+
                     raga2 = gr.Dropdown(list(RAGA_HINTS.keys()), label="Raag/Thaat (optional)", value="Yaman (Kalyan)")
                     extra2 = gr.Textbox(label="Extra prompt (optional)")
                     structure2 = gr.Dropdown(STRUCTURE_PRESETS, label="Structure", value=STRUCTURE_PRESETS[0])
+
+                    # Editable creative controls that feed into the prompt
+                    mood2 = gr.Textbox(label="Mood (e.g., emotive, devotional, cinematic)", value="emotive, cinematic")
+                    energy2 = gr.Textbox(label="Energy (e.g., mellow, uplifting, driving)", value="mellow")
+                    # Instruments that start from a sensible preset for the chosen song type
+                    
+                    
+                    # instruments2 = gr.CheckboxGroup(
+                    #     choices=suggested_instruments("Devotional (Bhajan)"),
+                    #     value=suggested_instruments("Devotional (Bhajan)"),
+                    #     label="Instruments (you can add/remove)"
+                    # )
+
+                    # def _update_instr2(song_type_val, current_sel):
+                    #     choices = suggested_instruments(song_type_val)
+                    #     keep = [x for x in (current_sel or []) if x in choices] or choices
+                    #     return gr.update(choices=choices, value=keep)
+
+                    # song_type2.change(_update_instr2, inputs=[song_type2, instruments2], outputs=instruments2)
+
+                    instruments2 = gr.CheckboxGroup(
+                        choices=ALL_INSTRUMENTS,
+                        value=suggested_instruments("Devotional (Bhajan)"),
+                        label="Instruments (you can add/remove)"
+                    )
+
+                    def _update_instr2(song_type_val):
+                        return gr.update(value=suggested_instruments(song_type_val))
+
+                    song_type2.change(_update_instr2, inputs=[song_type2], outputs=instruments2)
+
+                    with gr.Accordion("Use / override detected musical info (optional)", open=False):
+                        override_bpm = gr.Textbox(label="BPM override (leave blank to use auto-detected)")
+                        override_key = gr.Textbox(label="Key override, e.g., C major (leave blank to use auto-detected)")
+                        override_range = gr.Textbox(label="Vocal range override, e.g., C3–C5 (leave blank to use auto-detected)")
+
                     cfg2 = gr.Slider(1.5, 4.5, value=3.0, step=0.1, label="CFG (guidance strength)")
                     seed2 = gr.Number(value=99, precision=0, label="Seed (int)")
                     model2 = gr.Dropdown(["Small (Melody)", "Medium", "Large"], value="Medium", label="Model size")
@@ -389,22 +460,22 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
             #     return gr.Number.update(value=dur), gr.Markdown.update(value=bpm_md), gr.Markdown.update(value=key_md), gr.Markdown.update(value=rng_md)
 
             def on_vocal_uploaded(path):
-                # Nothing uploaded yet → reset UI nicely
                 if not path:
                     return (
-                        gr.update(value=16),                 # duration Number
-                        gr.update(value="**Tempo:** –"),     # tempo Markdown
-                        gr.update(value="**Key/Mode:** –"),  # key Markdown
+                        gr.update(value=16),
+                        gr.update(value="**Tempo:** –"),
+                        gr.update(value="**Key/Mode:** –"),
                         gr.update(value="**Vocal Range:** –"),
+                        gr.update(value=""),  # override_bpm
+                        gr.update(value=""),  # override_key
+                        gr.update(value=""),  # override_range
                     )
 
-                # 1) Safe duration probe (never raises)
                 try:
                     dur = safe_duration_seconds(path, clamp_min=8, clamp_max=60)
                 except Exception:
-                    dur = 30  # fallback if something truly odd happens
+                    dur = 30
 
-                # 2) Run analysis but never let it bubble out
                 try:
                     bpm, key_text, vlabel = analyze_vocal(path)
                 except Exception:
@@ -414,37 +485,122 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                 key_md = f"**Key/Mode:** {key_text}" if key_text else "**Key/Mode:** –"
                 rng_md = f"**Vocal Range:** {vlabel}" if vlabel else "**Vocal Range:** –"
 
-                # Always return a complete tuple so the HTTP body length matches
+                # Prefill overrides with detected values (as plain text the user can edit)
                 return (
                     gr.update(value=dur),
                     gr.update(value=bpm_md),
                     gr.update(value=key_md),
                     gr.update(value=rng_md),
+                    gr.update(value=str(int(round(bpm))) if bpm else ""),  # override_bpm
+                    gr.update(value=key_text or ""),                       # override_key
+                    gr.update(value=vlabel or ""),                         # override_range
                 )
 
 
-            vocal.change(on_vocal_uploaded, [vocal], [auto_duration, bpm_lbl, key_lbl, range_lbl])
 
-            def build_prompt_from_vocal(vocal_path, song_type, raga, extra, structure):
-                bpm, key_text, vlabel = analyze_vocal(vocal_path) if vocal_path else (None, None, None)
-                p = make_prompt(song_type, mood="emotive, cinematic", energy="mellow", extra=extra,
-                                instruments=suggested_instruments(song_type), raga_name=raga,
-                                bpm=bpm, key_text=key_text, vocal_range=vlabel, structure=structure)
+            vocal.change(
+                on_vocal_uploaded,
+                [vocal],
+                [auto_duration, bpm_lbl, key_lbl, range_lbl, override_bpm, override_key, override_range],
+            )
+
+            def build_prompt_from_vocal(
+                vocal_path,
+                song_type,
+                raga,
+                extra,
+                structure,
+                mood,
+                energy,
+                instruments,
+                bpm_override,
+                key_override,
+                range_override,
+            ):
+                # Auto-analysis if we have a vocal
+                det_bpm, det_key_text, det_vlabel = analyze_vocal(vocal_path) if vocal_path else (None, None, None)
+
+                # Apply overrides if provided
+                bpm_val = None
+                if bpm_override:
+                    try:
+                        bpm_val = float(bpm_override)
+                    except Exception:
+                        bpm_val = det_bpm
+                else:
+                    bpm_val = det_bpm
+
+                key_val = key_override.strip() if (key_override and key_override.strip()) else det_key_text
+                range_val = range_override.strip() if (range_override and range_override.strip()) else det_vlabel
+
+                # p = make_prompt(
+                #     song_type=song_type,
+                #     mood=mood,
+                #     energy=energy,
+                #     extra=extra,
+                #     instruments=instruments or suggested_instruments(song_type),
+                #     raga_name=raga,
+                #     bpm=bpm_val,
+                #     key_text=key_val,
+                #     vocal_range=range_val,
+                #     structure=structure,
+                # )
+
+                p = make_prompt(
+                    song_type=song_type,
+                    mood=mood,
+                    energy=energy,
+                    extra=extra,
+                    instruments=sanitize_instruments(instruments) or suggested_instruments(song_type),
+                    raga_name=raga,
+                    bpm=bpm_val,
+                    key_text=key_val,
+                    vocal_range=range_val,
+                    structure=structure,
+                )
+
                 return p
 
-            # Live prompt preview
-            for w in [vocal, song_type2, raga2, extra2, structure2]:
-                w.change(build_prompt_from_vocal, [vocal, song_type2, raga2, extra2, structure2], [prompt2])
 
-            def run_vocal(path, song_type, raga, extra, structure, duration, model, cfg, seed):
-                prompt = build_prompt_from_vocal(path, song_type, raga, extra, structure)
+            # Live prompt preview
+            # for w in [vocal, song_type2, raga2, extra2, structure2]:
+            #     w.change(build_prompt_from_vocal, [vocal, song_type2, raga2, extra2, structure2], [prompt2])
+
+            for w in [vocal, song_type2, raga2, extra2, structure2, mood2, energy2, instruments2, override_bpm, override_key, override_range]:
+                w.change(
+                    build_prompt_from_vocal,
+                    [vocal, song_type2, raga2, extra2, structure2, mood2, energy2, instruments2, override_bpm, override_key, override_range],
+                    [prompt2],
+                )
+
+            # def run_vocal(path, song_type, raga, extra, structure, duration, model, cfg, seed):
+            #     prompt = build_prompt_from_vocal(path, song_type, raga, extra, structure)
+            #     out_path, wav = generate_music(prompt, duration, model, cfg, int(seed))
+            #     wav_np = _ensure_2d_cpu_f32(wav).numpy().T
+            #     return str(out_path), (SR, wav_np), prompt
+
+            # gen2.click(
+            #     run_vocal,
+            #     [vocal, song_type2, raga2, extra2, structure2, auto_duration, model2, cfg2, seed2],
+            #     [path2, audio2, prompt2],
+            # )
+
+            def run_vocal(path, song_type, raga, extra, structure, duration, model, cfg, seed,
+                        mood, energy, instruments, bpm_override, key_override, range_override):
+                prompt = build_prompt_from_vocal(
+                    path, song_type, raga, extra, structure, mood, energy, instruments,
+                    bpm_override, key_override, range_override
+                )
                 out_path, wav = generate_music(prompt, duration, model, cfg, int(seed))
                 wav_np = _ensure_2d_cpu_f32(wav).numpy().T
                 return str(out_path), (SR, wav_np), prompt
 
             gen2.click(
                 run_vocal,
-                [vocal, song_type2, raga2, extra2, structure2, auto_duration, model2, cfg2, seed2],
+                [
+                    vocal, song_type2, raga2, extra2, structure2, auto_duration, model2, cfg2, seed2,
+                    mood2, energy2, instruments2, override_bpm, override_key, override_range
+                ],
                 [path2, audio2, prompt2],
             )
 
@@ -461,10 +617,7 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                     out_gain = gr.Slider(-12, 12, value=-1.0, step=0.5, label="Output gain / limiter target (dBFS)")
                     mix_btn = gr.Button("Mix & Export")
 
-            mix_audio = gr.Audio(label="Mix Preview", interactive=False)
-            mix_path = gr.File(label="Saved Mix WAV")
-
-            mix_audio = gr.Audio(label="Mix Preview", interactive=False)
+            mix_audio = gr.Audio(label="Mix Preview", interactive=False, streaming=False)
             mix_path = gr.File(label="Saved Mix WAV")
 
             def _db_to_lin(db):
@@ -547,9 +700,9 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
             mix_btn.click(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
 
             # Real-time preview when sliders move
-            vocal_gain.change(debounce_mix, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
-            instr_gain.change(debounce_mix, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
-            out_gain.change(debounce_mix, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+            vocal_gain.release(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+            instr_gain.release(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+            out_gain.release(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
 
 
     gr.Markdown("""
