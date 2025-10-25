@@ -1,47 +1,47 @@
-import torch, torchaudio, numpy as np
+# --- replace the file body in gen_instrumental_from_text.py ---
+
+import os
+import torch
+import torchaudio
 from audiocraft.models import MusicGen
 
-
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SR = 32000  # MusicGen uses 32 kHz
-DURATION = 20  # seconds
+SR = 32000
 
-prompt = (
-    "uplifting pop backing track, bright acoustic guitar strums, warm bass, "
-    "tight drums with snare on 2 and 4, 120 bpm, no vocals"
-)
+def _save_wav(wav_t, sr, out_path):
+    # (T,) → (1,T) float32 on CPU
+    if wav_t.dim() == 2 and wav_t.size(0) == 1:
+        wav_t = wav_t[0]
+    wav_t = wav_t.detach().to("cpu").float().contiguous()
+    wav_t = wav_t.unsqueeze(0)  # mono
+    torchaudio.save(out_path, wav_t, sr)
 
-print("Loading model (first run will download weights)...")
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def generate_from_text(
+    prompt,
+    duration_sec=15,
+    model_size="medium",
+    cfg_coef=3.0,
+    seed=42
+):
+    repo = {
+        "small":  "facebook/musicgen-small",
+        "medium": "facebook/musicgen-medium",
+        "large":  "facebook/musicgen-large",
+    }.get(model_size, "facebook/musicgen-medium")
 
-try:
-    # Many builds accept a device kwarg
-    model = MusicGen.get_pretrained("facebook/musicgen-medium", device=DEVICE)
-except TypeError:
-    # Fallback: set after load
-    model = MusicGen.get_pretrained("facebook/musicgen-medium")
-    try:
-        model.set_device(DEVICE)  # Audiocraft API in 1.3.x
-    except AttributeError:
-        pass  # model will still run on CPU; CUDA still speeds up heavy ops underneath
+    model = MusicGen.get_pretrained(repo, device=DEVICE)
+    model.set_generation_params(duration=duration_sec, cfg_coef=cfg_coef)
+    if seed is not None:
+        torch.manual_seed(int(seed))
 
-model.set_generation_params(duration=DURATION, top_k=250, top_p=0.0, temperature=1.0)
+    with torch.no_grad():
+        wav = model.generate(descriptions=[prompt])[0]  # (T,)
+    os.makedirs("outputs", exist_ok=True)
+    out_path = os.path.join("outputs", "instrumental_32k.wav")
+    _save_wav(wav, SR, out_path)
+    return out_path
 
-print("Generating...")
-with torch.no_grad():
-    wav = model.generate(descriptions=[prompt], progress=True)  # [B, T]
-
-# wav is a torch Tensor on GPU/CPU returned by model.generate
-wav = wav[0].detach().cpu()  # remove batch -> now [1, T] or [T]
-
-# Ensure 2D [channels, time] for torchaudio.save
-if wav.dim() == 1:          # [T]
-    wav = wav.unsqueeze(0)  # -> [1, T]
-elif wav.dim() == 3:        # [1, 1, T]
-    wav = wav.squeeze(0)    # -> [1, T]
-# if wav.dim() == 2, it's already [C, T]; do nothing
-
-wav = wav.to(torch.float32)
-torchaudio.save("instrumental_32k.wav", wav, 32000)
-print("Saved: instrumental_32k.wav")
+if __name__ == "__main__":
+    p = "Devotional bhajan with harmonium and gentle tabla, peaceful, uplifting, no vocals"
+    path = generate_from_text(p, duration_sec=14, model_size="medium", cfg_coef=2.8, seed=123)
+    print("Saved:", path)

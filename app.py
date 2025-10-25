@@ -1,709 +1,547 @@
-# app.py
 import os
 import math
 import time
 from pathlib import Path
-from typing import Optional, Tuple
-
-# New import line for app.py
-from audio_analysis_utils import (
-    detect_key_mode, 
-    detect_vocal_range, 
-    safe_tempo_detect, 
-    safe_duration_seconds,
-)
+from typing import Tuple, Optional, List
 
 import torch
 import torchaudio
+import numpy as np
 import gradio as gr
 
-# Optional deps used if present; guarded imports
-try:
-    import librosa
-except Exception:
-    librosa = None
-
-try:
-    import soundfile as sf  # noqa: F401  (used indirectly by torchaudio backend)
-except Exception:
-    sf = None
-
+# Audiocraft / MusicGen
 from audiocraft.models import MusicGen
 
-SR = 32000
-OUT_DIR = Path("outputs")
-OUT_DIR.mkdir(exist_ok=True)
+# Local helpers (you already have this file)
+from audio_analysis_utils import (
+    load_mono_resample,
+    safe_tempo_detect,
+    detect_key_mode,
+    detect_vocal_range,
+    safe_duration_seconds,
+)
 
+# -----------------------------------------------------------------------------
+# Global config
+# -----------------------------------------------------------------------------
+SR = 32000  # MusicGen sample rate
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEFAULT_MODEL = "facebook/musicgen-medium"
 
-# ---- Prompt Builder Presets & Helper ---------------------------------------
-PROMPT_PRESETS = {
-    "Bollywood Romantic Ballad": {
-        "default_instruments": ["acoustic guitar", "piano", "warm bass", "soft pads", "light drums"],
-        "tempos": ["slow (70–85)", "medium (86–100)"],
-        "moods": ["romantic", "emotional", "tender", "nostalgic"],
-        "percussion": ["soft kick/snare", "tambourine", "brush kit"],
-        "references": ["Arijit Singh", "Amit Trivedi", "Pritam"],
-    },
-    "Bollywood Upbeat / Dance": {
-        "default_instruments": ["synths", "punchy drums", "808 bass", "claps", "bright leads"],
-        "tempos": ["fast (105–130)"],
-        "moods": ["energetic", "upbeat", "anthemic"],
-        "percussion": ["EDM kit", "electronic percussion", "dhol (fusion)"],
-        "references": ["Badshah", "Honey Singh", "Pritam"],
-    },
-    "Devotional (Bhajan)": {
-        "default_instruments": ["harmonium", "tabla", "dholak", "acoustic guitar (light)", "tanpura drone", "flute"],
-        "tempos": ["slow (65–85)", "medium (86–100)"],
-        "moods": ["peaceful", "devotional", "reverent"],
-        "percussion": ["tabla", "dholak", "manjeera"],
-        "references": ["Anup Jalota", "Jubin Nautiyal (devotional)"],
-    },
-    "Sufi / Qawwali": {
-        "default_instruments": ["harmonium", "tabla", "dholak", "claps", "strings pad", "bass (subtle)"],
-        "tempos": ["medium (80–100)"],
-        "moods": ["spiritual", "uplifting", "intense (build)"],
-        "percussion": ["tabla", "dholak", "handclaps"],
-        "references": ["Nusrat Fateh Ali Khan", "Rahat Fateh Ali Khan"],
-    },
-    "Ghazal": {
-        "default_instruments": ["acoustic guitar", "piano", "harmonium (soft)", "violin/strings", "upright bass (soft)"],
-        "tempos": ["slow (65–80)"],
-        "moods": ["poetic", "melancholic", "intimate"],
-        "percussion": ["very light tabla or brush kit"],
-        "references": ["Jagjit Singh"],
-    },
-    "Sanskrit Mantra / Chant": {
-        "default_instruments": ["tanpura drone", "gentle pads", "soft bells", "light percussion (anklet/ghungroo)"],
-        "tempos": ["slow (60–80)"],
-        "moods": ["meditative", "calming", "spiritual"],
-        "percussion": ["very light (if any)"],
-        "references": ["Deva Premal (style ref)"],
-    },
-    "Kirtan / Call-and-Response": {
-        "default_instruments": ["harmonium", "tabla", "dholak", "acoustic guitar", "claps", "tanpura drone"],
-        "tempos": ["medium (80–100)"],
-        "moods": ["devotional", "participatory", "uplifting"],
-        "percussion": ["tabla", "dholak", "manjeera"],
-        "references": ["Krishna Das (style ref)"],
-    },
-    "Filmi Orchestral / Cinematic": {
-        "default_instruments": ["strings (legato + staccato)", "piano", "timpani/taikos", "brass (soft)", "choir pads"],
-        "tempos": ["slow build (70–95)"],
-        "moods": ["cinematic", "emotional", "grand"],
-        "percussion": ["orchestral percussion"],
-        "references": ["A.R. Rahman (cinematic)"],
-    },
-    "Lo-fi Bollywood": {
-        "default_instruments": ["lofi drums", "warm keys", "soft guitar", "vinyl crackle", "subtle bass"],
-        "tempos": ["slow/medium (70–92)"],
-        "moods": ["dreamy", "nostalgic", "chill"],
-        "percussion": ["lofi kit"],
-        "references": ["lofi remix vibe"],
-    },
-}
-
-# Raag / Thaat → prompt phrase
-RAGA_HINTS = {
-    "": "",
-    "Raag Yaman (Kalyan thaat)": "hints of Raag Yaman (Lydian feel)",
-    "Raag Bhairav": "touches of Raag Bhairav (Phrygian ♮3 mood)",
-    "Raag Bhupali (Bilawal/Kalyan mix)": "phrases inspired by Raag Bhupali (pentatonic major vibe)",
-    "Raag Kafi": "Kafi colour (Dorian/folksy sweetness)",
-    "Raag Khamaj": "Khamaj flavour (Mixolydian warmth)",
-    "Raag Todi": "Todi shades (complex, yearning microtonal feel)",
-    "Raag Darbari": "Darbari gravitas (deep, regal ambience)",
-}
-
-ARRANGEMENT_CHOICES = [
-    "steady all through",
-    "intro calm → verse moderate → chorus full",
-    "intro pad/drone → groove enters at verse → chorus big, then soft outro",
-    "soft intro → build through verse → big chorus → breakdown → final chorus",
-]
-
-PRO_TIPS = {
-    "Bollywood Romantic Ballad": "CFG ~2.0–3.5 • Keep seed fixed for consistency (e.g., 42). Change seed for alternate takes.",
-    "Bollywood Upbeat / Dance": "CFG ~2.5–4.0 • If drums feel weak, bump CFG slightly and try 2–3 different seeds.",
-    "Devotional (Bhajan)": "CFG ~2.5–4.0 • Lower temperature helps steadiness. Keep seed fixed across verses.",
-    "Sufi / Qawwali": "CFG ~2.5–4.0 • Try a few seeds to find energetic builds that complement claps/tabla.",
-    "Ghazal": "CFG ~2.0–3.0 • Fixed seed gives intimate continuity. Try 2–3 seeds for subtle texture changes.",
-    "Sanskrit Mantra / Chant": "CFG ~2.0–3.0 • Low temperature & fixed seed reinforce the meditative drone/pattern.",
-    "Kirtan / Call-and-Response": "CFG ~2.5–4.0 • Fixed seed for main take; try 1–2 higher seeds for livelier chorus.",
-    "Filmi Orchestral / Cinematic": "CFG ~3.0–4.5 • Try multiple seeds—arrangement variety helps cinematic arcs.",
-    "Lo-fi Bollywood": "CFG ~2.0–3.0 • Keep seed fixed; small CFG changes affect drums/bass tightness.",
-}
-
-def _clean_join(items):
-    return ", ".join([s for s in items if s and s.strip()])
-
-# Function to be added to app.py or a new utility module
-
-
-
-def build_prompt_from_selections(
-    song_type, instruments, extra_instr, mood, tempo_note,
-    arrangement, era, key_note, scale_mode, percussion, ref_artists,
-    fx, mix_notes, language_hint, lyric_theme, raag_phrase: str = ""
-):
-    line1 = [song_type]
-    if language_hint:
-        line1.append(f"({language_hint})")
-    if lyric_theme:
-        line1.append(f"— theme: {lyric_theme}")
-    header = " ".join([s for s in line1 if s])
-
-    inst_parts = []
-    if instruments:
-        inst_parts.append(_clean_join(instruments))
-    if extra_instr:
-        inst_parts.append(extra_instr)
-    inst_block = _clean_join(inst_parts)
-
-    perc_block = _clean_join(percussion)
-
-    props = []
-    if mood:
-        props.append(mood)
-    if tempo_note:
-        props.append(f"tempo {tempo_note} BPM range")
-    if key_note:
-        if scale_mode:
-            props.append(f"key {key_note} {scale_mode}")
-        else:
-            props.append(f"key {key_note}")
-    elif scale_mode:
-        props.append(f"mode {scale_mode}")
-    if era:
-        props.append(f"{era} aesthetics")
-    if raag_phrase:
-        props.append(raag_phrase)
-
-    arrange = f"Arrangement: {arrangement}." if arrangement else ""
-    fx_block = f"FX: {fx}." if fx else ""
-    mix = f"Mix/Production: {mix_notes}." if mix_notes else ""
-    ref = f"Reference vibe: {_clean_join(ref_artists)}." if ref_artists else ""
-
-    prompt_lines = [
-        header.strip(),
-        f"Instruments: {inst_block}." if inst_block else "",
-        f"Percussion: {perc_block}." if perc_block else "",
-        f"Character: {_clean_join(props)}." if props else "",
-        arrange,
-        fx_block,
-        mix,
-        ref
-    ]
-    prompt = " ".join([p for p in prompt_lines if p]).strip()
-    return prompt
-
-# ------------ Utilities ------------
-
-def _ensure_stereo(y: torch.Tensor) -> torch.Tensor:
-    if y.dim() == 1:
-        y = y.unsqueeze(0)
-    if y.shape[0] == 1:
-        y = y.repeat(2, 1)
-    return y
-
-def _resample_if_needed(wav: torch.Tensor, sr: int, target_sr: int = SR) -> torch.Tensor:
-    if sr == target_sr:
-        return wav
-    return torchaudio.functional.resample(wav, sr, target_sr)
-
-def _normalize_peak(wav: torch.Tensor, target_peak: float = 0.98) -> torch.Tensor:
-    peak = wav.abs().max().item()
-    if peak > 0:
-        wav = wav * (target_peak / peak)
-    return wav
-
-def _db_to_lin(db):
-    return 10.0 ** (db / 20.0)
-
-def _soft_limiter(wav: torch.Tensor, ceiling_db: float = -1.0) -> torch.Tensor:
-    ceiling = _db_to_lin(ceiling_db)
-    wav = torch.tanh(2.5 * wav)
-    peak = wav.abs().max().item()
-    if peak > 0:
-        wav = wav * min(1.0, ceiling / peak)
-    return wav
-
-def _save_wav(wav_t: torch.Tensor, sr: int, out_path: Path):
-    if wav_t.ndim == 1:
-        wav_t = wav_t.unsqueeze(0)
-    elif wav_t.ndim == 3:
-        wav_t = wav_t[0]
-    wav_t = wav_t.detach().to(torch.float32).clamp_(-1.0, 1.0).cpu()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torchaudio.save(str(out_path), wav_t, sr)
-
-# def _safe_tempo_detect(vocal_path: str) -> int:
-#     if librosa is None:
-#         return 100
-#     try:
-#         y, sr = librosa.load(vocal_path, sr=None, mono=True)
-#         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-#         tempo = float(tempo[0]) if hasattr(tempo, "__len__") else float(tempo)
-#         tempo = int(round(tempo)) if math.isfinite(tempo) and tempo > 0 else 100
-#         return max(40, min(200, tempo))
-#     except Exception:
-#         return 100
-
-# def _safe_duration_seconds(path: str, clamp_min=8, clamp_max=60) -> int:
-#     try:
-#         info = torchaudio.info(path)
-#         secs = int(round(info.num_frames / max(1, info.sample_rate)))
-#         return max(clamp_min, min(clamp_max, secs))
-#     except Exception:
-#         # Fallback via librosa if available
-#         if librosa is not None:
-#             try:
-#                 secs = int(round(librosa.get_duration(filename=path)))
-#                 return max(clamp_min, min(clamp_max, secs))
-#             except Exception:
-#                 pass
-#         return 30
-
-# ------------ Model cache ------------
-
+# Cache models by size so switching is instant
 _MODEL_CACHE = {}
 
-def _get_model(model_size: str = "medium") -> MusicGen:
-    key = (model_size, DEVICE)
-    if key in _MODEL_CACHE:
-        return _MODEL_CACHE[key]
-    repo = {
-        "small": "facebook/musicgen-small",
-        "medium": "facebook/musicgen-medium",
-        "large": "facebook/musicgen-large",
-    }.get(model_size, "facebook/musicgen-medium")
-    model = MusicGen.get_pretrained(repo)
-    _MODEL_CACHE[key] = model
+def get_model(model_size: str) -> MusicGen:
+    """Return a MusicGen model on correct device with sane defaults."""
+    if model_size in _MODEL_CACHE:
+        return _MODEL_CACHE[model_size]
+
+    name = {
+        "Small (Melody)": "facebook/musicgen-small",
+        "Medium": "facebook/musicgen-medium",
+        "Large": "facebook/musicgen-large",
+    }.get(model_size, DEFAULT_MODEL)
+
+    model = MusicGen.get_pretrained(name, device=DEVICE)
+    # Slightly conservative defaults; we always override via set_generation_params
+    model.set_generation_params(
+        use_sampling=True,
+        top_k=250,
+        top_p=0.0,
+        temperature=1.0,
+        cfg_coef=3.0,
+        duration=10,
+    )
+    _MODEL_CACHE[model_size] = model
     return model
 
-# ------------ Generation functions ------------
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
 
-def gen_from_text_ui(
+def _ensure_2d_cpu_f32(wav_t: torch.Tensor) -> torch.Tensor:
+    """Torchaudio.save wants (channels, time) on CPU float32."""
+    if wav_t is None:
+        raise ValueError("Empty audio tensor")
+
+    if wav_t.dim() == 3:  # (B, C, T) or (B, T, 1)
+        # squeeze batch
+        wav_t = wav_t[0]
+    if wav_t.dim() == 1:  # (T,) -> (1, T)
+        wav_t = wav_t.unsqueeze(0)
+    elif wav_t.dim() == 2:
+        pass
+    else:
+        # Some models return (T, C) – transpose
+        if wav_t.shape[0] < wav_t.shape[1]:
+            wav_t = wav_t.transpose(0, 1)
+    return wav_t.detach().to("cpu", dtype=torch.float32)
+
+
+def _save_wav(wav_t: torch.Tensor, sr: int, out_path: Path) -> Path:
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wav = _ensure_2d_cpu_f32(wav_t)
+    torchaudio.save(str(out_path), wav, sr)
+    return out_path
+
+
+def _estimate_duration_from_file(path: str) -> float:
+    if not path:
+        return 10.0
+    info = torchaudio.info(path)
+    return max(1.0, info.num_frames / float(info.sample_rate))
+
+
+# -----------------------------------------------------------------------------
+# Prompt building
+# -----------------------------------------------------------------------------
+
+BOLLY_INSTRUMENTS = [
+    "tabla", "dholak", "bansuri", "sitar", "tanpura",
+    "acoustic guitar", "electric bass", "strings section",
+    "pads", "piano", "shehnai", "santoor", "harmonium"
+]
+
+DEVOTIONAL_INSTRUMENTS = [
+    "tabla", "mridangam", "tanpura", "harmonium", "bansuri",
+    "soft strings", "temple bells", "santoor", "light pads"
+]
+
+MANTRA_INSTRUMENTS = [
+    "tanpura", "bells", "drones", "oceanic pads", "subtle percussion"
+]
+
+RAGA_HINTS = {
+    "None": "",
+    "Yaman (Kalyan)": "hints of Raag Yaman (Lydian feel)",
+    "Bhairav": "hints of Raag Bhairav (Phrygian dominant flavor)",
+    "Bhairavi": "hints of Raag Bhairavi (minor / Komal notes)",
+    "Kafi": "hints of Raag Kafi (Dorian mood)",
+    "Khamaj": "hints of Raag Khamaj (Mixolydian color)",
+    "Bilawal": "hints of Raag Bilawal (Ionian/major)",
+}
+
+SONG_TYPES = [
+    "Bollywood Ballad",
+    "Upbeat Bollywood",
+    "Devotional (Bhajan)",
+    "Sanskrit Mantra / Chant",
+    "Lo-fi Bollywood",
+    "Classical Fusion",
+]
+
+STRUCTURE_PRESETS = [
+    "intro-verse-chorus-verse-chorus-outro",
+    "pad intro-verse-chorus-bridge-chorus",
+    "short intro-verse-chorus",
+]
+
+
+def suggested_instruments(song_type: str) -> List[str]:
+    if song_type in ("Bollywood Ballad", "Upbeat Bollywood", "Lo-fi Bollywood"):
+        return BOLLY_INSTRUMENTS
+    if song_type == "Devotional (Bhajan)":
+        return DEVOTIONAL_INSTRUMENTS
+    if song_type == "Sanskrit Mantra / Chant":
+        return MANTRA_INSTRUMENTS
+    return ["piano", "strings", "acoustic guitar", "bass", "pads"]
+
+
+def make_prompt(
+    song_type: str,
+    mood: str,
+    energy: str,
+    extra: str,
+    instruments: List[str],
+    raga_name: str,
+    bpm: Optional[float],
+    key_text: Optional[str],
+    vocal_range: Optional[str],
+    structure: Optional[str],
+) -> str:
+    lines = []
+    if song_type:
+        lines.append(song_type)
+    if mood:
+        lines.append(mood)
+    if energy:
+        lines.append(f"energy: {energy}")
+
+    if raga_name and RAGA_HINTS.get(raga_name):
+        lines.append(RAGA_HINTS[raga_name])
+
+    if instruments:
+        lines.append("instruments: " + ", ".join(instruments))
+
+    if bpm and bpm > 0:
+        lines.append(f"around {int(round(bpm))} BPM")
+
+    if key_text:
+        lines.append(f"key: {key_text}")
+
+    if vocal_range:
+        lines.append(f"supporting vocal range {vocal_range}")
+
+    if structure:
+        lines.append(f"structure: {structure}")
+
+    if extra:
+        lines.append(extra)
+
+    # Gentle production directions that help MusicGen
+    lines.append(
+        "clean studio mix, warm low-end, wide stereo, subtle reverb, avoid vocals"
+    )
+
+    return ", ".join([s for s in lines if s])
+
+
+# -----------------------------------------------------------------------------
+# Core generation
+# -----------------------------------------------------------------------------
+
+def generate_music(
     prompt: str,
-    duration: int = 30,
-    model_size: str = "medium",
-    top_k: int = 250,
-    top_p: float = 0.0,
-    temperature: float = 1.0,
-    cfg_coef: float = 3.0,
-    seed: Optional[int] = 42,
-    progress=gr.Progress()
-) -> Tuple[str, Tuple[int, list]]:
-    progress(0, desc="Loading model…")
-    model = _get_model(model_size)
-    if seed is not None and isinstance(seed, int):
-        torch.manual_seed(seed)
+    duration: float,
+    model_size: str,
+    cfg: float,
+    seed: int,
+) -> Tuple[Path, torch.Tensor]:
+    model = get_model(model_size)
+    # Re-seed
+    if seed is None or seed < 0:
+        seed = int(time.time()) & 0x7FFFFFFF
+    torch.manual_seed(seed)
+    if DEVICE == "cuda":
+        torch.cuda.manual_seed_all(seed)
 
+    # Set params per request
     model.set_generation_params(
-        duration=int(duration),
-        top_k=int(top_k),
-        top_p=float(top_p),
-        temperature=float(temperature),
-        cfg_coef=float(cfg_coef),
+        use_sampling=True,
+        top_k=250,
+        temperature=1.0,
+        duration=max(1, int(round(duration))),
+        cfg_coef=float(cfg),
     )
 
-    progress(0.3, desc="Generating audio…")
-    wav = model.generate([prompt])[0]
-    wav_t = wav if isinstance(wav, torch.Tensor) else torch.from_numpy(wav)
-    wav_t = _ensure_stereo(wav_t)
-    wav_t = _normalize_peak(wav_t, 0.98)
+    with torch.inference_mode():
+        wav = model.generate(descriptions=[prompt], progress=True)
+        # MusicGen returns (B, T) at SR=32000
+        wav = wav[0]  # (T,)
 
-    ts = int(time.time())
-    out_path = OUT_DIR / f"instrumental_from_text_{ts}.wav"
-    _save_wav(wav_t, SR, out_path)
-    progress(1.0, desc=f"Saved → {out_path.name}")
-    return str(out_path), (SR, wav_t.mean(0).detach().cpu().numpy())
-
-
-# def gen_for_vocal_ui_OLD(
-#     vocal_file: str,
-#     extra_prompt: str = "",
-#     duration: int = 30,
-#     model_size: str = "medium",
-#     cfg_coef: float = 3.0,
-#     seed: Optional[int] = 42,
-#     progress=gr.Progress()
-# ) -> Tuple[str, Tuple[int, list], str]:
-#     if not vocal_file:
-#         raise gr.Error("Please upload a vocal file (WAV/MP3/FLAC).")
-
-#     progress(0, desc="Estimating tempo…")
-#     bpm = safe_tempo_detect(vocal_file)
-
-#     base_prompt = f"supportive modern pop backing, clean drums, warm bass, light pads, avoid vocals, {bpm} bpm"
-#     prompt = (base_prompt + ", " + extra_prompt.strip()) if extra_prompt.strip() else base_prompt
-
-#     progress(0.25, desc="Loading model…")
-#     model = _get_model(model_size)
-#     if seed is not None and isinstance(seed, int):
-#         torch.manual_seed(seed)
-
-#     model.set_generation_params(
-#         duration=int(duration),
-#         cfg_coef=float(cfg_coef),
-#     )
-
-#     progress(0.6, desc="Generating accompaniment…")
-#     wav = model.generate([prompt])[0]
-#     wav_t = wav if isinstance(wav, torch.Tensor) else torch.from_numpy(wav)
-#     wav_t = _ensure_stereo(wav_t)
-#     wav_t = _normalize_peak(wav_t, 0.98)
-
-#     ts = int(time.time())
-#     out_path = OUT_DIR / f"instrumental_for_vocal_{ts}.wav"
-#     _save_wav(wav_t, SR, out_path)
-
-#     progress(1.0, desc=f"Saved → {out_path.name}")
-#     return str(out_path), (SR, wav_t.mean(0).detach().cpu().numpy()), f"Detected BPM ≈ {bpm}"
-
-# Simplified gen_for_vocal_ui in app.py
-def gen_for_vocal_ui(
-    vocal_file: str,
-    prompt: str = "", # Now accepts the full, smart prompt
-    duration: int = 30,
-    model_size: str = "medium",
-    cfg_coef: float = 3.0,
-    seed: Optional[int] = 42,
-    progress=gr.Progress()
-) -> Tuple[str, Tuple[int, list]]: # Removed the bpm_label return
-    if not vocal_file:
-        raise gr.Error("Please upload a vocal file (WAV/MP3/FLAC).")
-
-    # Removed the redundant BPM calculation and base_prompt creation
-
-    progress(0.25, desc="Loading model…")
-    model = _get_model(model_size)
-    if seed is not None and isinstance(seed, int):
-        torch.manual_seed(seed)
-
-    model.set_generation_params(
-        duration=int(duration),
-        cfg_coef=float(cfg_coef),
-    )
-
-    progress(0.6, desc="Generating accompaniment…")
-    # Use the full, smart prompt passed directly
-    wav = model.generate([prompt])[0] 
-    wav_t = wav if isinstance(wav, torch.Tensor) else torch.from_numpy(wav)
-    wav_t = _ensure_stereo(wav_t)
-    wav_t = _normalize_peak(wav_t, 0.98)
-
-    ts = int(time.time())
-    out_path = OUT_DIR / f"instrumental_for_vocal_{ts}.wav"
-    _save_wav(wav_t, SR, out_path)
-
-    progress(1.0, desc=f"Saved → {out_path.name}")
-    # Return only the path and audio data
-    return str(out_path), (SR, wav_t.mean(0).detach().cpu().numpy())
-
-def mix_ui(
-    vocal_file: str,
-    instrumental_file: str,
-    vocal_gain_db: float = -2.0,
-    music_gain_db: float = -1.0,
-    limiter_ceiling_db: float = -1.0,
-) -> Tuple[str, Tuple[int, list]]:
-    if not vocal_file or not instrumental_file:
-        raise gr.Error("Please provide both vocal and instrumental files.")
-    v_wav, v_sr = torchaudio.load(vocal_file)
-    m_wav, m_sr = torchaudio.load(instrumental_file)
-
-    v_wav = _resample_if_needed(v_wav, v_sr, SR)
-    m_wav = _resample_if_needed(m_wav, m_sr, SR)
-    v_wav = _ensure_stereo(v_wav)
-    m_wav = _ensure_stereo(m_wav)
+    out_dir = Path("outputs")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"musicgen_{int(time.time())}.wav"
+    saved = _save_wav(wav, SR, out_path)
+    return saved, wav
 
 
-    # Previous: Pad to longest length
-    # T = max(v_wav.shape[-1], m_wav.shape[-1])
-    # if v_wav.shape[-1] < T:
-    #     v_wav = torch.nn.functional.pad(v_wav, (0, T - v_wav.shape[-1]))
-    # if m_wav.shape[-1] < T:
-    #     m_wav = torch.nn.functional.pad(m_wav, (0, T - m_wav.shape[-1]))
+# -----------------------------------------------------------------------------
+# Analysis pipeline for vocals
+# -----------------------------------------------------------------------------
 
-    # NEW: Determine the shortest length (Vocal) and trim the longer one (Instrumental)
-    V_T = v_wav.shape[-1]
-    M_T = m_wav.shape[-1]
-    
-    T = min(V_T, M_T) # The final mix length will be the shortest input length
+def analyze_vocal(vocal_path: str):
+    if not vocal_path:
+        return None, None, None
 
-    # Trim to shortest length
-    v_wav = v_wav[..., :T]
-    m_wav = m_wav[..., :T]
+    # Load mono @ SR for downstream analyzers
+    y, sr = load_mono_resample(vocal_path, target_sr=SR)
+
+    # tempo: helper expects the *path*, not raw audio
+    bpm = safe_tempo_detect(vocal_path)
+
+    # key/mode: helper returns (key_root, mode) -> make "C major" style label
+    key_root, key_mode = detect_key_mode(y, sr)
+    key_text = f"{key_root} {key_mode}".strip() if key_root and key_mode else None
+
+    # vocal range: helper already returns a single string label like "C3-C5"
+    vlabel = detect_vocal_range(y, sr)
+
+    return bpm, key_text, vlabel
 
 
-    # Apply Gains
-    v_wav = v_wav * _db_to_lin(vocal_gain_db)
-    m_wav = m_wav * _db_to_lin(music_gain_db)
 
-    # Mix and Master (Soft Limiter)
-    mix = v_wav + m_wav
-    mix = _soft_limiter(mix, limiter_ceiling_db)
+# -----------------------------------------------------------------------------
+# Gradio UI
+# -----------------------------------------------------------------------------
 
-    ts = int(time.time())
-    out_path = OUT_DIR / f"song_mix_{ts}.wav"
-    _save_wav(mix, SR, out_path)
-    return str(out_path), (SR, mix.mean(0).detach().cpu().numpy())
+with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
+    gr.Markdown("""
+    # 🎵 AI Singer Studio
+    Create instrumentals **from text** or **to match your vocal**.
+    - Uses **Meta MusicGen** under the hood (AudioCraft).
+    - Auto-detects **tempo**, **key**, and **vocal range** from your voice.
+    - Smart **prompt generator** with Bollywood/Devotional/Mantra presets and **Raag hints**.
+    """)
 
-# ------------ UI ------------
+    with gr.Tabs():
+        # ----------------------------- TAB 1: Text → Instrumental -----------------------------
+        with gr.Tab("From Text"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    song_type = gr.Dropdown(SONG_TYPES, label="Song Type", value="Bollywood Ballad")
+                    mood = gr.Textbox(label="Mood (e.g., romantic, cinematic)")
+                    energy = gr.Textbox(label="Energy (e.g., mellow, driving)")
+                    raga = gr.Dropdown(list(RAGA_HINTS.keys()), label="Raag/Thaat (optional)", value="None")
+                    structure = gr.Dropdown(STRUCTURE_PRESETS, label="Structure", value=STRUCTURE_PRESETS[0])
+                    instr = gr.CheckboxGroup(choices=suggested_instruments("Bollywood Ballad"), label="Suggested Instruments")
+                    extra = gr.Textbox(label="Extra prompt (optional)")
 
-def render_prompt_builder(target_extra_prompt_box: gr.Textbox, pro_tips_md: gr.Markdown):
-    with gr.Accordion("🎼 Prompt Builder (Indian Styles)", open=False):
-        with gr.Row():
-            song_type = gr.Dropdown(
-                label="Song Type",
-                choices=list(PROMPT_PRESETS.keys()),
-                value="Bollywood Romantic Ballad"
-            )
-            language = gr.Dropdown(
-                label="Language / Lyric Type",
-                choices=["Hindi", "Urdu", "Sanskrit", "Punjabi", "Instrumental (no lyrics)"],
-                value="Hindi"
-            )
-            era = gr.Dropdown(
-                label="Era / Aesthetic",
-                choices=["modern", "2000s", "1990s", "classic filmi", "fusion"],
-                value="modern"
+                    with gr.Accordion("Pro Tips", open=False):
+                        gr.Markdown(
+                            "- **CFG**: 2.5–3.5 is usually musical.\n"
+                            "- **Seed**: Fix a seed for repeatable results; change it to explore variations.\n"
+                            "- **Duration**: Generate shorter ideas first (8–16s) then iterate."
+                        )
+                        auto_btn = gr.Button("Use Recommended CFG & Seed")
+
+                with gr.Column(scale=1):
+                    duration1 = gr.Slider(4, 60, value=16, step=1, label="Duration (sec)")
+                    cfg1 = gr.Slider(1.5, 4.5, value=3.0, step=0.1, label="CFG (guidance strength)")
+                    seed1 = gr.Number(value=42, precision=0, label="Seed (int)")
+                    model1 = gr.Dropdown(["Small (Melody)", "Medium", "Large"], value="Medium", label="Model size")
+                    prompt_out = gr.Textbox(label="Final Prompt Preview", interactive=False)
+                    gen1 = gr.Button("Generate Instrumental")
+
+            audio1 = gr.Audio(label="Preview", interactive=False)
+            path1 = gr.File(label="Saved WAV")
+
+            def _update_instr(song_type_val):
+                #return gr.CheckboxGroup.update(choices=suggested_instruments(song_type_val))
+                return gr.update(choices=suggested_instruments(song_type_val))
+
+            song_type.change(_update_instr, inputs=song_type, outputs=instr)
+
+            def _build_prompt_ui(song_type, mood, energy, extra, instruments, raga, duration):
+                # No key/tempo/vocal range on text tab
+                p = make_prompt(song_type, mood, energy, extra, instruments or [], raga, None, None, None, structure=None)
+                return p
+
+            for w in [song_type, mood, energy, extra, instr, raga]:
+                w.change(_build_prompt_ui, [song_type, mood, energy, extra, instr, raga, duration1], prompt_out)
+
+            def _pro_tips():
+                # Very light heuristics
+                # return gr.Slider.update(value=3.2), gr.Number.update(value=42)
+                return gr.update(value=3.2), gr.update(value=42)
+
+            auto_btn.click(_pro_tips, [], [cfg1, seed1])
+
+            def run_text(song_type, mood, energy, extra, instruments, raga, duration, model, cfg, seed):
+                prompt = make_prompt(song_type, mood, energy, extra, instruments or [], raga, None, None, None, structure=None)
+                out_path, wav = generate_music(prompt, duration, model, cfg, int(seed))
+                # Return audio numpy for immediate preview
+                wav_np = _ensure_2d_cpu_f32(wav).numpy().T  # (T, C)
+                return str(out_path), (SR, wav_np), prompt
+
+            gen1.click(
+                run_text,
+                [song_type, mood, energy, extra, instr, raga, duration1, model1, cfg1, seed1],
+                [path1, audio1, prompt_out],
             )
 
-        with gr.Row():
-            mood = gr.Dropdown(
-                label="Mood",
-                choices=sum([v["moods"] for v in PROMPT_PRESETS.values()], []),
-                value="romantic"
+        # ----------------------------- TAB 2: Vocal → Instrumental ----------------------------
+        with gr.Tab("From Vocal"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    vocal = gr.Audio(type="filepath", label="Upload Dry Vocal (mono or stereo)")
+                    auto_duration = gr.Number(value=16, precision=0, label="Auto Duration (sec)")
+                    bpm_lbl = gr.Markdown("**Tempo:** –")
+                    key_lbl = gr.Markdown("**Key/Mode:** –")
+                    range_lbl = gr.Markdown("**Vocal Range:** –")
+
+                with gr.Column(scale=1):
+                    song_type2 = gr.Dropdown(SONG_TYPES, label="Song Type", value="Devotional (Bhajan)")
+                    raga2 = gr.Dropdown(list(RAGA_HINTS.keys()), label="Raag/Thaat (optional)", value="Yaman (Kalyan)")
+                    extra2 = gr.Textbox(label="Extra prompt (optional)")
+                    structure2 = gr.Dropdown(STRUCTURE_PRESETS, label="Structure", value=STRUCTURE_PRESETS[0])
+                    cfg2 = gr.Slider(1.5, 4.5, value=3.0, step=0.1, label="CFG (guidance strength)")
+                    seed2 = gr.Number(value=99, precision=0, label="Seed (int)")
+                    model2 = gr.Dropdown(["Small (Melody)", "Medium", "Large"], value="Medium", label="Model size")
+
+            prompt2 = gr.Textbox(label="Final Prompt Preview", interactive=False)
+            gen2 = gr.Button("Analyze & Generate Backing Track")
+            audio2 = gr.Audio(label="Instrumental Preview", interactive=False)
+            path2 = gr.File(label="Saved WAV (instrumental)")
+
+            # When vocal uploaded → auto-duration + analysis
+            # def on_vocal_uploaded(path):
+            #     if not path:
+            #         return gr.Number.update(value=16), gr.Markdown.update(value="**Tempo:** –"), gr.Markdown.update(value="**Key/Mode:** –"), gr.Markdown.update(value="**Vocal Range:** –")
+            #     dur = int(round(_estimate_duration_from_file(path)))
+            #     bpm, key_text, vlabel = analyze_vocal(path)
+            #     bpm_md = f"**Tempo:** ~{int(round(bpm))} BPM" if bpm else "**Tempo:** –"
+            #     key_md = f"**Key/Mode:** {key_text}" if key_text else "**Key/Mode:** –"
+            #     rng_md = f"**Vocal Range:** {vlabel}" if vlabel else "**Vocal Range:** –"
+            #     return gr.Number.update(value=dur), gr.Markdown.update(value=bpm_md), gr.Markdown.update(value=key_md), gr.Markdown.update(value=rng_md)
+
+            def on_vocal_uploaded(path):
+                # Nothing uploaded yet → reset UI nicely
+                if not path:
+                    return (
+                        gr.update(value=16),                 # duration Number
+                        gr.update(value="**Tempo:** –"),     # tempo Markdown
+                        gr.update(value="**Key/Mode:** –"),  # key Markdown
+                        gr.update(value="**Vocal Range:** –"),
+                    )
+
+                # 1) Safe duration probe (never raises)
+                try:
+                    dur = safe_duration_seconds(path, clamp_min=8, clamp_max=60)
+                except Exception:
+                    dur = 30  # fallback if something truly odd happens
+
+                # 2) Run analysis but never let it bubble out
+                try:
+                    bpm, key_text, vlabel = analyze_vocal(path)
+                except Exception:
+                    bpm, key_text, vlabel = None, None, None
+
+                bpm_md = f"**Tempo:** ~{int(round(bpm))} BPM" if bpm else "**Tempo:** –"
+                key_md = f"**Key/Mode:** {key_text}" if key_text else "**Key/Mode:** –"
+                rng_md = f"**Vocal Range:** {vlabel}" if vlabel else "**Vocal Range:** –"
+
+                # Always return a complete tuple so the HTTP body length matches
+                return (
+                    gr.update(value=dur),
+                    gr.update(value=bpm_md),
+                    gr.update(value=key_md),
+                    gr.update(value=rng_md),
+                )
+
+
+            vocal.change(on_vocal_uploaded, [vocal], [auto_duration, bpm_lbl, key_lbl, range_lbl])
+
+            def build_prompt_from_vocal(vocal_path, song_type, raga, extra, structure):
+                bpm, key_text, vlabel = analyze_vocal(vocal_path) if vocal_path else (None, None, None)
+                p = make_prompt(song_type, mood="emotive, cinematic", energy="mellow", extra=extra,
+                                instruments=suggested_instruments(song_type), raga_name=raga,
+                                bpm=bpm, key_text=key_text, vocal_range=vlabel, structure=structure)
+                return p
+
+            # Live prompt preview
+            for w in [vocal, song_type2, raga2, extra2, structure2]:
+                w.change(build_prompt_from_vocal, [vocal, song_type2, raga2, extra2, structure2], [prompt2])
+
+            def run_vocal(path, song_type, raga, extra, structure, duration, model, cfg, seed):
+                prompt = build_prompt_from_vocal(path, song_type, raga, extra, structure)
+                out_path, wav = generate_music(prompt, duration, model, cfg, int(seed))
+                wav_np = _ensure_2d_cpu_f32(wav).numpy().T
+                return str(out_path), (SR, wav_np), prompt
+
+            gen2.click(
+                run_vocal,
+                [vocal, song_type2, raga2, extra2, structure2, auto_duration, model2, cfg2, seed2],
+                [path2, audio2, prompt2],
             )
-            tempo = gr.Dropdown(
-                label="Tempo",
-                choices=sum([v["tempos"] for v in PROMPT_PRESETS.values()], []),
-                value="medium (86–100)"
-            )
-            key_note = gr.Textbox(label="Key (optional, e.g., A minor)", value="")
-            scale_mode = gr.Dropdown(
-                label="Mode (optional)",
-                choices=["", "major", "minor", "dorian", "mixolydian", "harmonic minor"],
-                value=""
-            )
 
-        with gr.Row():
-            raag = gr.Dropdown(
-                label="Raag / Thaat (inject flavour)",
-                choices=list(RAGA_HINTS.keys()),
-                value=""
-            )
-            arrangement = gr.Dropdown(
-                label="Arrangement / Energy Curve",
-                choices=ARRANGEMENT_CHOICES,
-                value="intro calm → verse moderate → chorus full"
-            )
-            fx = gr.Textbox(label="FX / Space (optional)", placeholder="gentle reverb, light delay, subtle chorus on pads")
+        # ----------------------------- TAB 3: Mix Vocal + Instrumental ------------------------
+        with gr.Tab("Mix"):
+            with gr.Row():
+                with gr.Column():
+                    # Use File widgets to avoid audio streaming quirks on Windows
+                    mix_vocal = gr.File(file_types=["audio"], label="Vocal track (WAV/MP3/M4A/…)")
+                    mix_instr = gr.File(file_types=["audio"], label="Instrumental track (WAV/MP3/M4A/…)")
+                with gr.Column():
+                    vocal_gain = gr.Slider(-12, 12, value=0, step=0.5, label="Vocal gain (dB)")
+                    instr_gain = gr.Slider(-12, 12, value=0, step=0.5, label="Instrumental gain (dB)")
+                    out_gain = gr.Slider(-12, 12, value=-1.0, step=0.5, label="Output gain / limiter target (dBFS)")
+                    mix_btn = gr.Button("Mix & Export")
 
-        with gr.Row():
-            ref_artists = gr.CheckboxGroup(
-                label="Reference Artists (optional)",
-                choices=list({a for v in PROMPT_PRESETS.values() for a in v.get("references", [])}),
-                value=[]
-            )
+            mix_audio = gr.Audio(label="Mix Preview", interactive=False)
+            mix_path = gr.File(label="Saved Mix WAV")
 
-        with gr.Row():
-            base_instruments = gr.CheckboxGroup(
-                label="Core Instruments",
-                choices=list({i for v in PROMPT_PRESETS.values() for i in v["default_instruments"]}),
-                value=PROMPT_PRESETS["Bollywood Romantic Ballad"]["default_instruments"]
-            )
-            extra_instruments = gr.Textbox(label="Add Instruments (comma-separated)", placeholder="sitar, sarod, shehnai")
+            mix_audio = gr.Audio(label="Mix Preview", interactive=False)
+            mix_path = gr.File(label="Saved Mix WAV")
 
-        with gr.Row():
-            percussion = gr.CheckboxGroup(
-                label="Percussion",
-                choices=list({p for v in PROMPT_PRESETS.values() for p in v.get("percussion", [])}),
-                value=["soft kick/snare", "tambourine"]
-            )
+            def _db_to_lin(db):
+                return 10 ** (db / 20.0)
 
-        with gr.Row():
-            lyric_theme = gr.Textbox(label="Lyric / Theme (optional)", placeholder="longing, devotion, festival, sunrise meditation")
-            mix_notes = gr.Textbox(label="Mix / Production Notes (optional)", placeholder="warm, intimate vocal pocket, gentle sidechain")
+            def _soft_limiter(x: torch.Tensor, thresh_db=-1.0):
+                # Simple hard-knee limiter for safety
+                peak = x.abs().max().item() if x.numel() else 1.0
+                if peak > 0:
+                    x = x / max(1.0, peak)
+                target = _db_to_lin(thresh_db)
+                return x.clamp(-target, target)
 
-        def _sync_presets(st):
-            preset = PROMPT_PRESETS.get(st, PROMPT_PRESETS["Bollywood Romantic Ballad"])
-            # Update Pro Tips too
-            tips = PRO_TIPS.get(st, "CFG ~2.0–4.0 • Keep seed fixed for consistency; change for variants.")
-            return (
-                gr.update(value=preset["moods"][0] if preset["moods"] else None),
-                gr.update(value=preset["tempos"][0] if preset["tempos"] else None),
-                gr.update(value=preset["default_instruments"]),
-                gr.update(value=preset.get("percussion", [])),
-                gr.update(value=[], interactive=True),
-                gr.update(value=f"### Pro tips\n{tips}\n\n- **Seed:** keep fixed to lock arrangement; change to explore variations.\n- **CFG:** higher = closer to prompt, lower = looser/airier."),
-            )
+            # def mix_tracks(vocal_path, instr_path, vocal_db, instr_db, out_db):
+            #     if not vocal_path or not instr_path:
+            #         raise gr.Error("Please provide both vocal and instrumental.")
+            #     v, vsr = load_mono_resample(vocal_path, target_sr=SR)
+            #     i, isr = load_mono_resample(instr_path, target_sr=SR)
+            #     T = max(len(v), len(i))
+            #     v = np.pad(v, (0, T - len(v)))
+            #     i = np.pad(i, (0, T - len(i)))
+            #     v_t = torch.tensor(v).unsqueeze(0)  # (1, T)
+            #     i_t = torch.tensor(i).unsqueeze(0)
+            #     v_t = v_t * _db_to_lin(vocal_db)
+            #     i_t = i_t * _db_to_lin(instr_db)
+            #     mix = v_t + i_t
+            #     mix = _soft_limiter(mix, thresh_db=out_db)
+            #     out_path = Path("outputs") / f"mix_{int(time.time())}.wav"
+            #     saved = _save_wav(mix.squeeze(0), SR, out_path)
+            #     mix_np = _ensure_2d_cpu_f32(mix.squeeze(0)).numpy().T
+            #     return str(saved), (SR, mix_np)
 
-        song_type.change(
-            _sync_presets,
-            inputs=[song_type],
-            outputs=[mood, tempo, base_instruments, percussion, ref_artists, pro_tips_md]
-        )
+            def _file_to_path(file_val):
+                # Gradio 5 returns {'name': 'C:\\...\\file.wav', 'size': ..., ...}
+                # Some setups pass a plain path string. Normalize to string path.
+                if isinstance(file_val, dict) and "name" in file_val:
+                    return file_val["name"]
+                return str(file_val) if file_val else None
 
-        make_prompt_btn = gr.Button("✨ Generate Prompt")
-        out_prompt = gr.Textbox(label="Generated Prompt", lines=4)
+            def mix_tracks(vocal_file, instr_file, vocal_db, instr_db, out_db):
+                vpath = _file_to_path(vocal_file)
+                ipath = _file_to_path(instr_file)
+                if not vpath or not ipath:
+                    raise gr.Error("Please provide both vocal and instrumental.")
 
-        def _make_prompt(st, bi, ei, m, t, arr, e, keyn, mode, perc, refs, fxv, mixv, lang, theme, raag_sel):
-            tempo_note = t
-            prompt = build_prompt_from_selections(
-                song_type=st,
-                instruments=bi,
-                extra_instr=ei,
-                mood=m,
-                tempo_note=tempo_note,
-                arrangement=arr,
-                era=e,
-                key_note=keyn,
-                scale_mode=mode,
-                percussion=perc,
-                ref_artists=refs,
-                fx=fxv,
-                mix_notes=mixv,
-                language_hint=lang,
-                lyric_theme=theme,
-                raag_phrase=RAGA_HINTS.get(raag_sel, ""),
-            )
-            return prompt, gr.update(value=prompt)
+                v, _ = load_mono_resample(vpath, target_sr=SR)
+                i, _ = load_mono_resample(ipath, target_sr=SR)
 
-        make_prompt_btn.click(
-            _make_prompt,
-            inputs=[song_type, base_instruments, extra_instruments, mood, tempo, arrangement, era,
-                    key_note, scale_mode, percussion, ref_artists, fx, mix_notes, language, lyric_theme, raag],
-            outputs=[out_prompt, target_extra_prompt_box]
-        )
+                T = max(len(v), len(i))
+                if T == 0:
+                    raise gr.Error("One of the files appears to be silent/empty.")
 
-    return out_prompt
+                v = np.pad(v, (0, T - len(v)))
+                i = np.pad(i, (0, T - len(i)))
 
-with gr.Blocks(title="AI Singer Studio") as demo:
-    gr.Markdown(
-        f"""# AI Singer Studio
-**Device:** `{DEVICE}` • **Sample Rate:** {SR} Hz  
-Generate instrumentals with Meta MusicGen, match an uploaded vocal, and mix.
-"""
-    )
+                v_t = torch.tensor(v, dtype=torch.float32).unsqueeze(0)  # (1, T)
+                i_t = torch.tensor(i, dtype=torch.float32).unsqueeze(0)  # (1, T)
 
-    # -------- Tab 1 --------
-    with gr.Tab("1) Instrumental from Text"):
-        with gr.Row():
-            prompt = gr.Textbox(label="Text prompt", placeholder="e.g., modern pop instrumental, bright synths, punchy drums, 120 bpm, no vocals", lines=3)
-        with gr.Row():
-            duration = gr.Slider(8, 60, value=30, step=1, label="Duration (seconds)")
-            model_size = gr.Dropdown(["small", "medium", "large"], value="medium", label="Model size")
-            seed = gr.Number(value=42, label="Seed (int or blank for random)")
-        with gr.Accordion("Advanced", open=False):
-            top_k = gr.Slider(0, 1000, value=250, step=1, label="top_k")
-            top_p = gr.Slider(0.0, 1.0, value=0.0, step=0.01, label="top_p")
-            temperature = gr.Slider(0.1, 2.0, value=1.0, step=0.05, label="temperature")
-            cfg_coef = gr.Slider(0.0, 6.0, value=3.0, step=0.1, label="cfg_coef")
+                def _db_to_lin(db):
+                    return 10 ** (db / 20.0)
 
-        gen_btn = gr.Button("Generate Instrumental")
-        out_path1 = gr.File(label="Saved WAV")
-        audio1 = gr.Audio(label="Preview", type="numpy")
+                def _soft_limiter(x: torch.Tensor, thresh_db=-1.0):
+                    peak = x.abs().max().item() if x.numel() else 1.0
+                    if peak > 0:
+                        x = x / max(1.0, peak)
+                    target = _db_to_lin(thresh_db)
+                    return x.clamp(-target, target)
 
-        gen_btn.click(
-            gen_from_text_ui,
-            inputs=[prompt, duration, model_size, top_k, top_p, temperature, cfg_coef, seed],
-            outputs=[out_path1, audio1],
-        )
+                v_t = v_t * _db_to_lin(vocal_db)
+                i_t = i_t * _db_to_lin(instr_db)
+                mix = v_t + i_t
+                mix = _soft_limiter(mix, thresh_db=out_db)
 
-    # -------- Tab 2 --------
-    with gr.Tab("2) Instrumental for Vocal"):
-        vocal_in = gr.Audio(label="Upload Vocal (WAV/MP3/FLAC)", type="filepath")
-        extra_prompt = gr.Textbox(label="Extra prompt (optional)", placeholder="e.g., airy pads, subtle guitar")
-        pro_tips_md = gr.Markdown("### Pro tips\nSelect a song type below to get CFG/seed suggestions.")
-        _ = render_prompt_builder(target_extra_prompt_box=extra_prompt, pro_tips_md=pro_tips_md)
-        with gr.Row():
-            duration2 = gr.Slider(8, 60, value=30, step=1, label="Duration (seconds)")
-            model_size2 = gr.Dropdown(["small", "medium", "large"], value="medium", label="Model size")
-            seed2 = gr.Number(value=42, label="Seed (int or blank for random)")
-            cfg2 = gr.Slider(0.0, 6.0, value=3.0, step=0.1, label="cfg_coef")
+                out_path = Path("outputs") / f"mix_{int(time.time())}.wav"
+                saved = _save_wav(mix.squeeze(0), SR, out_path)
+                mix_np = _ensure_2d_cpu_f32(mix.squeeze(0)).numpy().T
+                return str(saved), (SR, mix_np)
 
-        # Auto-estimate duration from uploaded vocal and prefill the slider
-        # def _autofill_duration(vocal_file):
-        #     if not vocal_file:
-        #         return gr.update()
-        #     secs = safe_duration_seconds(vocal_file, 8, 60)
-        #     return gr.update(value=secs)
 
-        # Change the old _autofill_duration:
-        def _autofill_duration(vocal_file):
-            if not vocal_file:
-                return gr.update()
-            # Now uses the imported function from our new utility file
-            secs = safe_duration_seconds(vocal_file, 8, 60)
-            return gr.update(value=secs)
+            mix_btn.click(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
 
-        vocal_in.change(_autofill_duration, inputs=[vocal_in], outputs=[duration2])
+    gr.Markdown("""
+    ---
+    **Notes**
+    - If you want **repeatable** results, keep the seed fixed.
+    - If your output feels too random, lower CFG slightly (e.g., 2.8–3.2).
+    - For longer songs, generate in **sections** (verse/chorus) and stitch in a DAW.
+    """)
 
-        gen2_btn = gr.Button("Generate Matching Instrumental")
-        bpm_text = gr.Markdown()
-        out_path2 = gr.File(label="Saved WAV")
-        audio2 = gr.Audio(label="Preview", type="numpy")
-
-        # def _wrap_gen_for_vocal(vocal_file, extra_prompt, duration, model_size, seed, cfg):
-        #     path, audio, bpm_label = gen_for_vocal_ui(vocal_file, extra_prompt, duration, model_size, cfg, seed)
-        #     bpm_md = f"**{bpm_label}**"
-        #     return bpm_md, path, audio
-
-        def _wrap_gen_for_vocal(vocal_file, extra_prompt, duration, model_size, seed, cfg):
-            if not vocal_file:
-                raise gr.Error("Please upload a vocal file (WAV/MP3/FLAC).")
-            
-            # --- 1. Load Vocal for Analysis ---
-            # Load with librosa to get numpy array for analysis functions
-            y, sr = librosa.load(vocal_file, sr=None, mono=True)
-
-            # --- 2. Perform Professional Analysis using Utils ---
-            bpm = safe_tempo_detect(vocal_file) # Replaces old simple BPM detection
-            key, mode = detect_key_mode(y, sr)
-            vrange = detect_vocal_range(y, sr)
-
-            # --- 3. Construct Advanced Prompt ---
-            key_prompt = f"in the key of {key} {mode}" if key and mode else "musically complementary"
-            
-            base_prompt = (
-                f"supportive modern pop backing {key_prompt}, clean drums, warm bass, light pads, "
-                f"support a singer with range {vrange}, {bpm} bpm, avoid vocals"
-            )
-            final_prompt = (base_prompt + ", " + extra_prompt.strip()) if extra_prompt.strip() else base_prompt
-            
-            # --- 4. Call the core generation function ---
-            path, audio, _ = gen_for_vocal_ui(vocal_file, final_prompt, duration, model_size, cfg, seed)
-            
-            # --- 5. Return Results to UI ---
-            bpm_md = f"**Detected BPM ≈ {bpm}, Key/Mode: {key} {mode}**"
-            return bpm_md, path, audio
-
-        gen2_btn.click(
-            _wrap_gen_for_vocal,
-            inputs=[vocal_in, extra_prompt, duration2, model_size2, seed2, cfg2],
-            outputs=[bpm_text, out_path2, audio2]
-        )
-
-    # -------- Tab 3 --------
-    with gr.Tab("3) Mix Vocal + Instrumental"):
-        v_in = gr.Audio(label="Vocal file", type="filepath")
-        m_in = gr.Audio(label="Instrumental file", type="filepath")
-        with gr.Row():
-            vocal_gain = gr.Slider(-12, 6, value=-2.0, step=0.5, label="Vocal gain (dB)")
-            music_gain = gr.Slider(-12, 6, value=-1.0, step=0.5, label="Music gain (dB)")
-            tp = gr.Slider(-6, -0.1, value=-1.0, step=0.1, label="Limiter Ceiling (dBTP)")
-        mix_btn = gr.Button("Mix")
-        out_mix = gr.File(label="Saved Mix")
-        audio_mix = gr.Audio(label="Preview", type="numpy")
-
-        mix_btn.click(
-            mix_ui,
-            inputs=[v_in, m_in, vocal_gain, music_gain, tp],
-            outputs=[out_mix, audio_mix]
-        )
 
 if __name__ == "__main__":
-    demo.launch(share=True)
+    demo.queue().launch(server_name="127.0.0.1", server_port=7860, inbrowser=False)

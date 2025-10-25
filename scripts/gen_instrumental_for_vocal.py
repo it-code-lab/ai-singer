@@ -1,83 +1,79 @@
-import numpy as np, torch, torchaudio, librosa
+# --- replace the core with this in gen_instrumental_for_vocal.py ---
+
+import os
+import torch
+import torchaudio
 from audiocraft.models import MusicGen
-from audio_analysis_utils import detect_key_mode, detect_vocal_range, safe_tempo_detect
+from audio_analysis_utils import estimate_bpm_key
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SR_VOC = 32000
+SR = 32000
 
-VOCAL_PATH = "vocal.wav"  # your dry vocal (mono is best)
+def _save_wav(wav_t, sr, out_path):
+    # (B,T) or (T,) → (T,) float32 on CPU for torchaudio
+    if wav_t.dim() == 2 and wav_t.size(0) == 1:
+        wav_t = wav_t[0]
+    wav_t = wav_t.detach().to("cpu").float().contiguous()
+    # mono
+    wav_t = wav_t.unsqueeze(0)  # (1, T)
+    torchaudio.save(out_path, wav_t, sr)
 
-y, sr = librosa.load(VOCAL_PATH, sr=None, mono=True)
+def build_prompt(base_prompt, key_label=None, raag_phrase=None, bpm=None):
+    parts = [base_prompt.strip()] if base_prompt else []
+    if key_label:
+        parts.append(f"key: {key_label}")
+    if raag_phrase:
+        parts.append(raag_phrase)
+    if bpm and bpm > 0:
+        parts.append(f"around {int(round(bpm))} BPM")
+    parts.append("cinematic, cohesive arrangement, no vocals")
+    return ", ".join(parts)
 
+def generate_for_vocal(
+    vocal_path,
+    extra_prompt="",
+    duration_sec=15,
+    model_size="medium",
+    cfg_coef=3.0,
+    seed=42,
+    raag_phrase=None
+):
+    # 1) analyze vocal
+    bpm, key_label, _vocal_range = estimate_bpm_key(vocal_path)
+    prompt = build_prompt(extra_prompt, key_label, raag_phrase, bpm)
 
-# rough tempo estimate
-# tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-# tempo = float(tempo[0]) if isinstance(tempo, (np.ndarray, list)) else float(tempo)
-# tempo = int(round(tempo)) if np.isfinite(tempo) and tempo > 0 else 100
+    # 2) load model
+    repo = {
+        "small":  "facebook/musicgen-small",
+        "medium": "facebook/musicgen-medium",
+        "large":  "facebook/musicgen-large",
+    }.get(model_size, "facebook/musicgen-medium")
 
+    model = MusicGen.get_pretrained(repo, device=DEVICE)
+    model.set_generation_params(duration=duration_sec, cfg_coef=cfg_coef)
 
-# rough vocal range estimate
-# f0 = librosa.yin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C6'), sr=sr)
-# f0 = f0[np.isfinite(f0)]
-# if len(f0):
-#     lo = librosa.hz_to_note(np.percentile(f0, 10))
-#     hi = librosa.hz_to_note(np.percentile(f0, 90))
-#     vrange = f"{lo}-{hi}"
-# else:
-#     vrange = "C3-C5"
+    # 3) seed (MusicGen uses torch seed)
+    if seed is not None:
+        torch.manual_seed(int(seed))
 
+    # 4) generate
+    with torch.no_grad():
+        wav = model.generate(descriptions=[prompt])[0]  # (T,) on device
+    os.makedirs("outputs", exist_ok=True)
+    out_path = os.path.join("outputs", "instrumental_for_vocal.wav")
+    _save_wav(wav, SR, out_path)
 
-# # 3. Auto-Detect Key and Mode (NEW PROFESSIONAL IMPROVEMENT)
-# key, mode = detect_key_mode(y, sr)
+    return out_path, bpm, key_label
 
-tempo = safe_tempo_detect(VOCAL_PATH)
-key, mode = detect_key_mode(y, sr)
-vrange = detect_vocal_range(y, sr)
-
-
-key_prompt = f"in the key of {key} {mode}" if key and mode else "musically complementary"
-
-
-duration = max(10, int(np.ceil(len(y)/sr)))  # seconds
-
-
-prompt = (
-    f"modern pop backing track {key_prompt}, around {tempo} bpm, support a singer with range {vrange}, "
-    "steady drums, electric bass, warm keys, clean mix, no vocals"
-)
-
-print(f"Prompt: {prompt} (duration ~{duration}s)")
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-try:
-    # Many builds accept a device kwarg
-    model = MusicGen.get_pretrained("facebook/musicgen-medium", device=DEVICE)
-except TypeError:
-    # Fallback: set after load
-    model = MusicGen.get_pretrained("facebook/musicgen-medium")
-    try:
-        model.set_device(DEVICE)  # Audiocraft API in 1.3.x
-    except AttributeError:
-        pass  # model will still run on CPU; CUDA still speeds up heavy ops underneath
-
-model.set_generation_params(duration=duration, top_k=250)
-
-with torch.no_grad():
-    wav = model.generate(descriptions=[prompt], progress=True)[0].cpu()
-
-# torchaudio.save("instrumental_for_vocal_32k.wav", wav.unsqueeze(0), 32000)
-# print("Saved: instrumental_for_vocal_32k.wav")
-
-# wav is a torch Tensor on GPU/CPU returned by model.generate
-wav = wav[0].detach().cpu()  # remove batch -> now [1, T] or [T]
-
-# Ensure 2D [channels, time] for torchaudio.save
-if wav.dim() == 1:          # [T]
-    wav = wav.unsqueeze(0)  # -> [1, T]
-elif wav.dim() == 3:        # [1, 1, T]
-    wav = wav.squeeze(0)    # -> [1, T]
-# if wav.dim() == 2, it's already [C, T]; do nothing
-
-wav = wav.to(torch.float32)
-torchaudio.save("instrumental_32k.wav", wav, 32000)
-print("Saved: instrumental_32k.wav")
+if __name__ == "__main__":
+    # minimal CLI example
+    path, bpm, key = generate_for_vocal(
+        vocal_path="demo_vocal.wav",
+        extra_prompt="Bollywood ballad with warm strings and soft tabla",
+        duration_sec=20,
+        model_size="medium",
+        cfg_coef=3.0,
+        seed=123,
+        raag_phrase="hints of Raag Yaman (Lydian feel)"
+    )
+    print("Saved:", path, "| BPM:", bpm, "| Key:", key)

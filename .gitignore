@@ -6,3 +6,4 @@
 /vocal.mp3
 /vocal.wav
 .gradio/certificate.pem
+__pycache__

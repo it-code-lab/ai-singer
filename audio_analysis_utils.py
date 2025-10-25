@@ -7,6 +7,80 @@ import torchaudio
 SR_TARGET = 32000 # Standard sample rate for music generation
 
 # --- Helper Function: Key/Mode Detection ---
+def _to_scalar(x, fallback=None):
+    """Return a Python float from a numpy array / list / scalar, else fallback."""
+    try:
+        arr = np.asarray(x)
+        if arr.size == 0:
+            return fallback
+        return float(arr.ravel()[0])
+    except Exception:
+        return fallback
+
+def safe_round(x, ndigits=0, fallback=None):
+    try:
+        return round(float(x), ndigits)
+    except Exception:
+        return fallback
+
+# ---------- I/O & duration ----------
+
+def load_mono_resample(path: str, sr: int | None = 32000, target_sr: int | None = None):
+    """
+    Load an audio file as MONO at target sample rate using librosa.
+    Accepts either 'sr' (default) or 'target_sr' (alias used by the UI).
+    Returns: (y: np.ndarray [T], sr: int)
+    """
+    use_sr = target_sr if target_sr is not None else sr
+    y, _sr = librosa.load(path, sr=use_sr, mono=True)
+    y = np.asarray(y, dtype=np.float32)
+    return y, use_sr
+
+
+def get_audio_duration(path: str, sr: int = 32000) -> float:
+    """Duration in seconds at the given resample rate."""
+    y, _ = load_mono_resample(path, sr=sr)
+    return float(len(y)) / float(sr) if len(y) else 0.0
+
+def estimate_bpm_key(vocal_path, sr=32000):
+    """
+    Returns (bpm:int|None, key_label:str|None, vocal_range:str|None)
+    - BPM is rounded to nearest int when valid
+    - Key is a nice label (e.g., 'C major' / 'A minor') when detectable
+    """
+    y, _sr = librosa.load(vocal_path, sr=sr, mono=True)
+    # BPM (librosa often returns an array; use first element)
+    tempo_arr = librosa.beat.tempo(y=y, sr=_sr, aggregate=None)
+    tempo = _to_scalar(tempo_arr, fallback=None)
+    bpm = int(round(tempo)) if tempo and np.isfinite(tempo) and tempo > 0 else None
+
+    # crude key guess (fallback if chroma is too weak)
+    try:
+        chroma = librosa.feature.chroma_cqt(y=y, sr=_sr)
+        chroma_mean = chroma.mean(axis=1)
+        pitch_class = int(np.argmax(chroma_mean))
+        KEY_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
+        key_guess = KEY_NAMES[pitch_class]
+        # very rough major/minor hint from spectral centroid vs. mode energy
+        mode = 'major' if chroma_mean[[0,4,7]].sum() >= chroma_mean[[2,5,9]].sum() else 'minor'
+        key_label = f"{key_guess} {mode}"
+    except Exception:
+        key_label = None
+
+    # vocal range (rough)
+    try:
+        f0 = librosa.yin(y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C6"), sr=_sr)
+        f0 = f0[np.isfinite(f0)]
+        if f0.size:
+            lo = librosa.hz_to_note(np.percentile(f0, 10))
+            hi = librosa.hz_to_note(np.percentile(f0, 90))
+            vocal_range = f"{lo}–{hi}"
+        else:
+            vocal_range = None
+    except Exception:
+        vocal_range = None
+
+    return bpm, key_label, vocal_range
 
 def detect_key_mode(y: np.ndarray, sr: int) -> tuple[str, str]:
     """
@@ -110,3 +184,10 @@ def safe_duration_seconds(path: str, clamp_min=8, clamp_max=60) -> int:
             except Exception:
                 pass
         return 30
+    
+__all__ = [
+    "load_mono_resample",
+    "get_audio_duration",
+    "estimate_bpm_key",
+    "safe_round",
+]
