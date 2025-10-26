@@ -135,6 +135,17 @@ MANTRA_INSTRUMENTS = [
     "tanpura", "bells", "drones", "oceanic pads", "subtle percussion"
 ]
 
+# NEW Song Types
+AMBIENT_INSTRUMENTS = [
+    "reverb pads", "synth bass", "evolving textures", "gated reverb drums",
+    "delay piano", "shimmering bells"
+]
+
+HIPHOP_INSTRUMENTS = [
+    "808 sub bass", "trap drums", "synth lead", "vinyl scratch FX",
+    "chopped vocal samples", "minimal pads"
+]
+
 RAGA_HINTS = {
     "None": "",
     "Yaman (Kalyan)": "hints of Raag Yaman (Lydian feel)",
@@ -152,17 +163,33 @@ SONG_TYPES = [
     "Sanskrit Mantra / Chant",
     "Lo-fi Bollywood",
     "Classical Fusion",
+    "Melancholy Ambient Electronic", # NEW
+    "High-Energy Hip-Hop Beat",      # NEW    
 ]
 
 STRUCTURE_PRESETS = [
     "intro-verse-chorus-verse-chorus-outro",
     "pad intro-verse-chorus-bridge-chorus",
     "short intro-verse-chorus",
+    "AABA (32-bar song form)", # NEW
+    "minimalist loop with build-up and breakdown", # NEW
 ]
 
+STRUCTURE_DESCRIPTIONS = {
+    "intro-verse-chorus-verse-chorus-outro": 
+        "**Standard Pop/Rock:** Best for high-energy songs with a clear focus on a repeatable chorus. Ensures distinct sections.",
+    "pad intro-verse-chorus-bridge-chorus":
+        "**Ballad/Emotive:** Use for softer, cinematic tracks. The 'bridge' provides a mid-song emotional shift before the final chorus buildup.",
+    "short intro-verse-chorus":
+        "**Quick Hit/Jingle:** Ideal for short, punchy clips (e.g., social media or advertising). Gets straight to the point without long development.",
+    "AABA (32-bar song form)":
+        "**Classic Jazz/Broadway:** Highly uniform and predictable. Use when consistency and melodic repetition are more important than complex arrangement.",
+    "minimalist loop with build-up and breakdown":
+        "**Electronic/Ambient:** Excellent for EDM, Lo-Fi, or tracks where the mood is built slowly. Focuses on rhythmic texture changes rather than melodic shifts.",
+}
 
 ALL_INSTRUMENTS = sorted(set(
-    BOLLY_INSTRUMENTS + DEVOTIONAL_INSTRUMENTS + MANTRA_INSTRUMENTS
+    BOLLY_INSTRUMENTS + DEVOTIONAL_INSTRUMENTS + MANTRA_INSTRUMENTS + AMBIENT_INSTRUMENTS + HIPHOP_INSTRUMENTS
 ))
 
 def sanitize_instruments(selected):
@@ -176,6 +203,10 @@ def suggested_instruments(song_type: str) -> List[str]:
         recs = DEVOTIONAL_INSTRUMENTS
     elif song_type == "Sanskrit Mantra / Chant":
         recs = MANTRA_INSTRUMENTS
+    elif song_type == "Melancholy Ambient Electronic": # NEW
+        recs = AMBIENT_INSTRUMENTS
+    elif song_type == "High-Energy Hip-Hop Beat":      # NEW
+        recs = HIPHOP_INSTRUMENTS
     else:
         # Fallback MUST use only items present in ALL_INSTRUMENTS
         recs = ["piano", "strings section", "acoustic guitar", "electric bass", "pads"]
@@ -220,14 +251,14 @@ def make_prompt(
         lines.append(f"supporting vocal range {vocal_range}")
 
     if structure:
-        lines.append(f"structure: {structure}")
+        lines.append(f"structure: {structure}") # HIGHLY important for uniformity
 
     if extra:
         lines.append(extra)
 
     # Gentle production directions that help MusicGen
     lines.append(
-        "clean studio mix, warm low-end, wide stereo, subtle reverb, avoid vocals"
+        "clean studio mix, **consistent arrangement**, warm low-end, wide stereo, subtle reverb, **AVOID ALL VOCALS**"
     )
 
     return ", ".join([s for s in lines if s])
@@ -355,6 +386,39 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                     prompt_out = gr.Textbox(label="Final Prompt Preview",lines=4, interactive=True)
                     gen1 = gr.Button("Generate Instrumental")
 
+                    # NEW Pro Tips section
+                    # with gr.Accordion("💡 Pro Tips for Coherent Music", open=False):
+                    #     gr.Markdown(
+                    #         "**1. Consistency:** Use the `Structure` dropdown to enforce arrangement (e.g., AABA) for a more uniform track.\n"
+                    #         "**2. Instrument Adherence:** The model often prioritizes **Genre** over the specific `Instruments` list. For strict adherence, use a less specific genre (e.g., 'ambient drone') or lower the CFG slightly (2.8–3.2).\n"
+                    #         "**3. Variation:** If outputs are too similar, **use a random Seed** (e.g., `seed=-1`) to explore the full range of possibilities.\n"
+                    #         "**4. CFG**: 2.5–3.5 is usually musical. High CFG (>4.0) can lead to harsh or inconsistent audio."
+                    #     )
+                    #     auto_btn = gr.Button("Use Recommended CFG (3.0) & New Random Seed")
+
+
+
+                    # NEW Pro Tips section
+                    with gr.Accordion("💡 Pro Tips for Coherent Music", open=False):
+                        gr.Markdown(
+                            "**1. Consistency:** Use the `Structure` dropdown to enforce arrangement (e.g., AABA) for a more uniform track.\n"
+                            "**2. Instrument Adherence:** The model often prioritizes **Genre** over the specific `Instruments` list. For strict adherence, use a less specific genre (e.g., 'ambient drone') or lower the CFG slightly (2.8–3.2).\n"
+                            "**3. Variation:** If outputs are too similar, **use a random Seed** (e.g., `seed=-1`) to explore the full range of possibilities.\n"
+                            "**4. CFG**: 2.5–3.5 is usually musical. High CFG (>4.0) can lead to harsh or inconsistent audio."
+                        )
+                        
+                        # --- NEW SECTION: Guidance for Structure Selection ---
+                        gr.Markdown("### Structure Selection Guidance")
+                        
+                        # Dynamically generate the list for easy maintenance
+                        structure_list = "\n".join([
+                            f"* **{k}**: {v}"
+                            for k, v in STRUCTURE_DESCRIPTIONS.items()
+                        ])
+                        gr.Markdown(structure_list)
+                        
+                        auto_btn = gr.Button("Use Recommended CFG (3.0) & New Random Seed")
+
             audio1 = gr.Audio(label="Preview", interactive=False)
             path1 = gr.File(label="Saved WAV")
 
@@ -368,13 +432,20 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
             # song_type.change(_update_instr, inputs=[song_type, instr], outputs=instr)
 
 
-            def _build_prompt_ui(song_type, mood, energy, extra, instruments, raga, duration):
+            def _build_prompt_ui(song_type, mood, energy, extra, instruments, raga, duration, structure):
                 # No key/tempo/vocal range on text tab
-                p = make_prompt(song_type, mood, energy, extra, instruments or [], raga, None, None, None, structure=None)
+                p = make_prompt(song_type, mood, energy, extra, instruments or [], raga, None, None, None, structure=structure)
                 return p
 
-            for w in [song_type, mood, energy, extra, instr, raga]:
-                w.change(_build_prompt_ui, [song_type, mood, energy, extra, instr, raga, duration1], prompt_out)
+            # for w in [song_type, mood, energy, extra, instr, raga]:
+            #     w.change(_build_prompt_ui, [song_type, mood, energy, extra, instr, raga, duration1], prompt_out)
+
+            for w in [song_type, mood, energy, extra, instr, raga, structure]: # ADD structure here
+                            w.change(
+                                _build_prompt_ui,
+                                [song_type, mood, energy, extra, instr, raga, duration1, structure], # ADD structure here
+                                prompt_out
+                            )
 
             def _pro_tips():
                 # Very light heuristics
@@ -383,7 +454,7 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
 
             auto_btn.click(_pro_tips, [], [cfg1, seed1])
 
-            def run_text(song_type, mood, energy, extra, instruments, raga, duration, model, cfg, seed):
+            def run_text(song_type, mood, energy, extra, instruments, raga, duration, model, cfg, seed, structure):
                 # prompt = make_prompt(song_type, mood, energy, extra, instruments or [], raga, None, None, None, structure=None)
 
                 prompt = make_prompt(
@@ -399,7 +470,7 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
 
             gen1.click(
                 run_text,
-                [song_type, mood, energy, extra, instr, raga, duration1, model1, cfg1, seed1],
+                [song_type, mood, energy, extra, instr, raga, duration1, model1, cfg1, seed1, structure],
                 [path1, audio1, prompt_out],
             )
 
