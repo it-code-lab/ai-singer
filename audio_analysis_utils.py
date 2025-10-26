@@ -184,7 +184,70 @@ def safe_duration_seconds(path: str, clamp_min=8, clamp_max=60) -> int:
             except Exception:
                 pass
         return 30
-    
+
+# ==== Loudness + ducking helpers (append to file) =============================
+
+import numpy as _np
+
+def rms_dbfs(x: _np.ndarray) -> float:
+    """RMS loudness in dBFS. x must be float32 mono in [-1, 1]."""
+    x = _np.asarray(x, dtype=_np.float32)
+    return 20.0 * _np.log10(_np.sqrt(_np.mean(_np.square(x)) + 1e-12))
+
+def peak_dbfs(x: _np.ndarray) -> float:
+    """Peak level in dBFS."""
+    return 20.0 * _np.log10(_np.max(_np.abs(x)) + 1e-12)
+
+def apply_gain_db(x: _np.ndarray, gain_db: float) -> _np.ndarray:
+    """Apply linear gain from dB."""
+    return x * (10.0 ** (gain_db / 20.0))
+
+def match_target_rms(x: _np.ndarray, target_dbfs: float) -> tuple[_np.ndarray, float]:
+    """Return (normalized, applied_gain_db) such that RMS ~= target_dbfs."""
+    current = rms_dbfs(x)
+    gain_db = float(target_dbfs - current)
+    return apply_gain_db(x, gain_db), gain_db
+
+def _env_ma(x: _np.ndarray, sr: int, win_ms: float = 10.0) -> _np.ndarray:
+    """Simple envelope via moving average of absolute signal."""
+    n = max(1, int(sr * win_ms / 1000.0))
+    k = _np.ones(n, dtype=_np.float32) / float(n)
+    return _np.convolve(_np.abs(x), k, mode="same")
+
+def duck_instrumental(
+    instrumental: _np.ndarray,
+    vocal: _np.ndarray,
+    sr: int,
+    threshold_db: float = -40.0,
+    duck_db: float = 4.0,
+    attack_ms: float = 12.0,
+    release_ms: float = 150.0,
+) -> _np.ndarray:
+    """
+    Light “voice-over” style ducking: when the vocal envelope exceeds a threshold,
+    reduce instrumental by duck_db, with attack/release smoothing.
+    """
+    env = _env_ma(vocal, sr, win_ms=10.0)
+    thr_lin = 10.0 ** (threshold_db / 20.0)
+
+    atk_n = max(1, int(sr * attack_ms / 1000.0))
+    rel_n = max(1, int(sr * release_ms / 1000.0))
+
+    target_duck = 10.0 ** (-abs(duck_db) / 20.0)  # 0..1
+    gain = 1.0
+    gains = _np.empty_like(env, dtype=_np.float32)
+
+    for i in range(env.shape[0]):
+        want = target_duck if env[i] > thr_lin else 1.0
+        # one-pole toward target (different speeds up vs down)
+        n = atk_n if want < gain else rel_n
+        alpha = 1.0 / float(n)
+        gain = (1.0 - alpha) * gain + alpha * want
+        gains[i] = gain
+
+    return instrumental * gains
+
+
 __all__ = [
     "load_mono_resample",
     "get_audio_duration",

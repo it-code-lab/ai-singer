@@ -21,12 +21,22 @@ from audio_analysis_utils import (
     safe_duration_seconds,
 )
 from threading import Timer
+
+from audio_analysis_utils import (
+    rms_dbfs, peak_dbfs, apply_gain_db, match_target_rms, duck_instrumental,
+)
+
 # -----------------------------------------------------------------------------
 # Global config
 # -----------------------------------------------------------------------------
 SR = 32000  # MusicGen sample rate
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DEFAULT_MODEL = "facebook/musicgen-medium"
+
+TARGET_VOCAL_DBFS = -18.0   # typical vocal RMS target
+TARGET_INST_DBFS  = -20.0   # keep backing slightly under vocal
+FINAL_PEAK_DBFS   = -1.0    # limiter target peak
+
 
 # Cache models by size so switching is instant
 _MODEL_CACHE = {}
@@ -342,7 +352,7 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                     cfg1 = gr.Slider(1.5, 4.5, value=3.0, step=0.1, label="CFG (guidance strength)")
                     seed1 = gr.Number(value=42, precision=0, label="Seed (int)")
                     model1 = gr.Dropdown(["Small (Melody)", "Medium", "Large"], value="Medium", label="Model size")
-                    prompt_out = gr.Textbox(label="Final Prompt Preview",lines=4, interactive=False)
+                    prompt_out = gr.Textbox(label="Final Prompt Preview",lines=4, interactive=True)
                     gen1 = gr.Button("Generate Instrumental")
 
             audio1 = gr.Audio(label="Preview", interactive=False)
@@ -454,7 +464,7 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                     seed2 = gr.Number(value=99, precision=0, label="Seed (int)")
                     model2 = gr.Dropdown(["Small (Melody)", "Medium", "Large"], value="Medium", label="Model size")
 
-            prompt2 = gr.Textbox(label="Final Prompt Preview", lines=4, interactive=False)
+            prompt2 = gr.Textbox(label="Final Prompt Preview", lines=4, interactive=True)
             gen2 = gr.Button("Analyze & Generate Backing Track")
             audio2 = gr.Audio(label="Instrumental Preview", interactive=False)
             path2 = gr.File(label="Saved WAV (instrumental)")
@@ -626,10 +636,13 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                     vocal_gain = gr.Slider(-12, 12, value=0, step=0.5, label="Vocal gain (dB)")
                     instr_gain = gr.Slider(-12, 12, value=0, step=0.5, label="Instrumental gain (dB)")
                     out_gain = gr.Slider(-12, 12, value=-1.0, step=0.5, label="Output gain / limiter target (dBFS)")
+                    auto_cb  = gr.Checkbox(value=True, label="Auto-balance & duck (recommended)")
+                    duck_sld = gr.Slider(0, 12, value=4, step=0.5, label="Ducking amount (dB)")
                     mix_btn = gr.Button("Mix & Export")
 
             mix_audio = gr.Audio(label="Mix Preview", interactive=False, streaming=False)
             mix_path = gr.File(label="Saved Mix WAV")
+            mix_info_md = gr.Markdown(label="Auto-mix steps", value="")
 
             def _db_to_lin(db):
                 return 10 ** (db / 20.0)
@@ -642,25 +655,6 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                 target = _db_to_lin(thresh_db)
                 return x.clamp(-target, target)
 
-            # def mix_tracks(vocal_path, instr_path, vocal_db, instr_db, out_db):
-            #     if not vocal_path or not instr_path:
-            #         raise gr.Error("Please provide both vocal and instrumental.")
-            #     v, vsr = load_mono_resample(vocal_path, target_sr=SR)
-            #     i, isr = load_mono_resample(instr_path, target_sr=SR)
-            #     T = max(len(v), len(i))
-            #     v = np.pad(v, (0, T - len(v)))
-            #     i = np.pad(i, (0, T - len(i)))
-            #     v_t = torch.tensor(v).unsqueeze(0)  # (1, T)
-            #     i_t = torch.tensor(i).unsqueeze(0)
-            #     v_t = v_t * _db_to_lin(vocal_db)
-            #     i_t = i_t * _db_to_lin(instr_db)
-            #     mix = v_t + i_t
-            #     mix = _soft_limiter(mix, thresh_db=out_db)
-            #     out_path = Path("outputs") / f"mix_{int(time.time())}.wav"
-            #     saved = _save_wav(mix.squeeze(0), SR, out_path)
-            #     mix_np = _ensure_2d_cpu_f32(mix.squeeze(0)).numpy().T
-            #     return str(saved), (SR, mix_np)
-
             def _file_to_path(file_val):
                 # Gradio 5 returns {'name': 'C:\\...\\file.wav', 'size': ..., ...}
                 # Some setups pass a plain path string. Normalize to string path.
@@ -668,52 +662,149 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
                     return file_val["name"]
                 return str(file_val) if file_val else None
 
-            def mix_tracks(vocal_file, instr_file, vocal_db, instr_db, out_db):
-                vpath = _file_to_path(vocal_file)
-                ipath = _file_to_path(instr_file)
+            # def mix_tracks(vocal_file, instr_file, vocal_db, instr_db, out_db):
+            #     vpath = _file_to_path(vocal_file)
+            #     ipath = _file_to_path(instr_file)
+            #     if not vpath or not ipath:
+            #         raise gr.Error("Please provide both vocal and instrumental.")
+
+            #     v, _ = load_mono_resample(vpath, target_sr=SR)
+            #     i, _ = load_mono_resample(ipath, target_sr=SR)
+
+            #     T = max(len(v), len(i))
+            #     if T == 0:
+            #         raise gr.Error("One of the files appears to be silent/empty.")
+
+            #     v = np.pad(v, (0, T - len(v)))
+            #     i = np.pad(i, (0, T - len(i)))
+
+            #     v_t = torch.tensor(v, dtype=torch.float32).unsqueeze(0)  # (1, T)
+            #     i_t = torch.tensor(i, dtype=torch.float32).unsqueeze(0)  # (1, T)
+
+            #     def _db_to_lin(db):
+            #         return 10 ** (db / 20.0)
+
+            #     def _soft_limiter(x: torch.Tensor, thresh_db=-1.0):
+            #         peak = x.abs().max().item() if x.numel() else 1.0
+            #         if peak > 0:
+            #             x = x / max(1.0, peak)
+            #         target = _db_to_lin(thresh_db)
+            #         return x.clamp(-target, target)
+
+            #     v_t = v_t * _db_to_lin(vocal_db)
+            #     i_t = i_t * _db_to_lin(instr_db)
+            #     mix = v_t + i_t
+            #     mix = _soft_limiter(mix, thresh_db=out_db)
+
+            #     out_path = Path("outputs") / f"mix_{int(time.time())}.wav"
+            #     saved = _save_wav(mix.squeeze(0), SR, out_path)
+            #     mix_np = _ensure_2d_cpu_f32(mix.squeeze(0)).numpy().T
+            #     return str(saved), (SR, mix_np)
+
+            def mix_tracks(
+                vocal_path: str,
+                instr_path: str,
+                vocal_db: float,
+                instr_db: float,
+                out_db: float,
+                auto_balance: bool = True,
+                duck_db: float = 4.0,
+            ):
+                """
+                Returns (out_path, (sr, np.float32 mono), info_markdown).
+                Auto path:
+                - RMS-normalize vocal/instrumental to targets
+                - Optional vocal-aware ducking on instrumental
+                - Sum, soft-limit, peak makeup to FINAL_PEAK_DBFS
+                Manual path:
+                - Apply user sliders, sum, soft-limit
+                """
+                vpath = _file_to_path(vocal_path)
+                ipath = _file_to_path(instr_path)
                 if not vpath or not ipath:
                     raise gr.Error("Please provide both vocal and instrumental.")
+    
+                # 1) Load & align (mono, SR global)
+                v, sr = load_mono_resample(vpath, SR)
+                i, _  = load_mono_resample(ipath, SR)
 
-                v, _ = load_mono_resample(vpath, target_sr=SR)
-                i, _ = load_mono_resample(ipath, target_sr=SR)
+                n = max(v.shape[0], i.shape[0])
+                if v.shape[0] < n:
+                    v = np.pad(v, (0, n - v.shape[0]))
+                if i.shape[0] < n:
+                    i = np.pad(i, (0, n - i.shape[0]))
 
-                T = max(len(v), len(i))
-                if T == 0:
-                    raise gr.Error("One of the files appears to be silent/empty.")
+                steps = []
 
-                v = np.pad(v, (0, T - len(v)))
-                i = np.pad(i, (0, T - len(i)))
+                if auto_balance:
+                    # 2) RMS-normalize both sides to musical targets
+                    v, v_gain_db = match_target_rms(v, TARGET_VOCAL_DBFS)
+                    i, i_gain_db = match_target_rms(i, TARGET_INST_DBFS)
+                    steps.append(f"- Vocal RMS → {TARGET_VOCAL_DBFS:.1f} dBFS (applied {v_gain_db:+.1f} dB)")
+                    steps.append(f"- Inst. RMS → {TARGET_INST_DBFS:.1f} dBFS (applied {i_gain_db:+.1f} dB)")
 
-                v_t = torch.tensor(v, dtype=torch.float32).unsqueeze(0)  # (1, T)
-                i_t = torch.tensor(i, dtype=torch.float32).unsqueeze(0)  # (1, T)
+                    # 3) Optional ducking where vocal is present
+                    if duck_db and duck_db > 0:
+                        i = duck_instrumental(i, v, sr, threshold_db=-40.0, duck_db=float(duck_db))
+                        steps.append(f"- Ducking: −{float(duck_db):.1f} dB when vocal present (auto)")
 
-                def _db_to_lin(db):
-                    return 10 ** (db / 20.0)
+                    v_mix = v
+                    i_mix = i
 
-                def _soft_limiter(x: torch.Tensor, thresh_db=-1.0):
-                    peak = x.abs().max().item() if x.numel() else 1.0
-                    if peak > 0:
-                        x = x / max(1.0, peak)
-                    target = _db_to_lin(thresh_db)
-                    return x.clamp(-target, target)
+                else:
+                    # Manual gains (the sliders the user sees)
+                    v_mix = apply_gain_db(v, float(vocal_db))
+                    i_mix = apply_gain_db(i, float(instr_db))
+                    steps.append(f"- Manual gains: Vocal {float(vocal_db):+.1f} dB, Inst {float(instr_db):+.1f} dB")
 
-                v_t = v_t * _db_to_lin(vocal_db)
-                i_t = i_t * _db_to_lin(instr_db)
-                mix = v_t + i_t
-                mix = _soft_limiter(mix, thresh_db=out_db)
+                # 4) Sum
+                mix = v_mix + i_mix
 
-                out_path = Path("outputs") / f"mix_{int(time.time())}.wav"
-                saved = _save_wav(mix.squeeze(0), SR, out_path)
-                mix_np = _ensure_2d_cpu_f32(mix.squeeze(0)).numpy().T
-                return str(saved), (SR, mix_np)
+                # 5) Soft limiter (simple peak clip to target dBFS)
+                peak = peak_dbfs(mix)
+                target_peak_lin = 10.0 ** (float(out_db) / 20.0)  # from UI slider (e.g., -1 dB)
+                target_peak_lin = min(target_peak_lin, 10.0 ** (FINAL_PEAK_DBFS / 20.0))
+                mix = np.clip(mix, -target_peak_lin, target_peak_lin)
+                steps.append(f"- Limiter: clip at {20*np.log10(target_peak_lin):.1f} dBFS")
 
+                # 6) Makeup to FINAL_PEAK_DBFS if we have headroom (keeps preview loud enough)
+                new_peak = peak_dbfs(mix)
+                makeup_db = FINAL_PEAK_DBFS - new_peak
+                if makeup_db > 0.1:  # only if there’s headroom
+                    mix = apply_gain_db(mix, makeup_db)
+                    steps.append(f"- Makeup gain: {makeup_db:+.1f} dB to reach {FINAL_PEAK_DBFS:.1f} dBFS peak")
 
-            mix_btn.click(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+                # 7) Save & return
+                out_dir = Path("outputs"); out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"mix_{int(time.time())}.wav"
+
+                # torchaudio.save expects 2D tensor [channels, samples] on CPU
+                mix_t = torch.from_numpy(mix.copy()).float().unsqueeze(0).cpu()
+                torchaudio.save(str(out_path), mix_t, sample_rate=sr)
+
+                info = "### Auto mix steps:\n" + "\n".join(steps)
+                return str(out_path), (sr, mix), info
+
+            # mix_btn.click(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+
+            mix_btn.click(
+                fn=mix_tracks,
+                inputs=[mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain, auto_cb, duck_sld],
+                outputs=[mix_path, mix_audio, mix_info_md],
+                show_progress=True,
+            )
+
 
             # Real-time preview when sliders move
-            vocal_gain.release(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
-            instr_gain.release(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
-            out_gain.release(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+            # vocal_gain.release(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+            # instr_gain.release(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+            # out_gain.release(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain], [mix_path, mix_audio])
+
+            vocal_gain.release(mix_tracks, [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain, auto_cb, duck_sld], [mix_path, mix_audio, mix_info_md])
+            instr_gain.release(mix_tracks,  [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain, auto_cb, duck_sld], [mix_path, mix_audio, mix_info_md])
+            out_gain.release(mix_tracks,   [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain, auto_cb, duck_sld], [mix_path, mix_audio, mix_info_md])
+            auto_cb.change(mix_tracks,         [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain, auto_cb, duck_sld], [mix_path, mix_audio, mix_info_md])
+            duck_sld.release(mix_tracks,       [mix_vocal, mix_instr, vocal_gain, instr_gain, out_gain, auto_cb, duck_sld], [mix_path, mix_audio, mix_info_md])
 
 
     gr.Markdown("""
@@ -726,4 +817,4 @@ with gr.Blocks(title="AI Singer Studio – Instrumental Generator") as demo:
 
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="127.0.0.1", server_port=7860, inbrowser=False)
+    demo.queue().launch(server_name="0.0.0.0", server_port=7860, share=False )
